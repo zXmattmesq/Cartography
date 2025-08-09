@@ -13,12 +13,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from aiohttp import web
+from concurrent.futures import ProcessPoolExecutor
+import uuid
+import sys
+import subprocess
 
 # ======================== CONFIG ========================
 ASSETS_DIR = Path(__file__).parent.resolve()
 EU4_SCRIPT = ASSETS_DIR / "eu4_viewer.py"
 
-# CSV categories produced by eu4_viewer.py
 CATEGORIES = {
     "overview":     {"file": "overview.csv"},
     "economy":      {"file": "economy.csv"},
@@ -28,29 +31,29 @@ CATEGORIES = {
     "legitimacy":   {"file": "legitimacy.csv"},
 }
 
-# Optional tag->name mapping (file with lines: TAG,Name)
 COUNTRY_NAMES_FILE = ASSETS_DIR / "country_names.csv"
 
-# Table defaults
 DEFAULT_TABLE_LIMIT = 10
-
-# Storage/cleanup policy (tweak via Render env vars)
-RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "8"))               # auto-delete outputs older than this
-MAX_TOTAL_STORAGE_MB = int(os.getenv("MAX_TOTAL_STORAGE_MB", "300"))    # total cap across all guilds
+RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "8"))
+MAX_TOTAL_STORAGE_MB = int(os.getenv("MAX_TOTAL_STORAGE_MB", "300"))
 WORKDIR_ROOT = Path(os.getenv("WORKDIR_ROOT", tempfile.gettempdir())) / "eu4bot_runs"
+MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "1")))
+MAX_SAVE_MB = int(os.getenv("MAX_SAVE_MB", "80"))
 
-# Concurrency cap (keep low for Render free plan)
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
-JOB_SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
-
-# Discord (slash commands only; no privileged intents needed)
+# Discord (no privileged intents needed for slash commands)
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Concurrency + simple queue metrics
+EXEC = ProcessPoolExecutor(max_workers=1)     # one worker process keeps RAM stable
+JOB_SEM = asyncio.Semaphore(MAX_CONCURRENCY)  # gate how many run at once
+RUNNING_JOBS = 0
+PENDING_JOBS = 0
 
 # Last processed workspace per guild
 LATEST_WORKDIR: Dict[int, Path] = {}
 
-# ================ STORAGE MANAGER ================
+# ======================== STORAGE MANAGER ========================
 def dir_size_bytes(path: Path) -> int:
     total = 0
     for p in path.rglob("*"):
@@ -76,7 +79,9 @@ def all_workdirs() -> List[Path]:
 
 def mark_touch(path: Path) -> None:
     now = time.time()
-    for p in [path, *path.glob("*")]:
+    try: os.utime(path, (now, now))
+    except Exception: pass
+    for p in path.glob("*"):
         try: os.utime(p, (now, now))
         except Exception: pass
 
@@ -88,7 +93,6 @@ def current_total_bytes() -> int:
     return sum(dir_size_bytes(p) for p in all_workdirs())
 
 def auto_purge() -> None:
-    """Purge by age first; then LRU until under size cap."""
     cutoff = time.time() - RETENTION_HOURS * 3600
     for wd in all_workdirs():
         try:
@@ -116,7 +120,7 @@ def auto_purge() -> None:
 async def janitor():
     auto_purge()
 
-# ================ COUNTRY NAMES ================
+# ======================== COUNTRY NAMES (optional) ========================
 def load_country_name_map() -> Dict[str, str]:
     m: Dict[str, str] = {}
     if COUNTRY_NAMES_FILE.exists():
@@ -142,7 +146,7 @@ def best_country_name(row: dict) -> str:
         return n
     return tag or "Unknown"
 
-# ================ CSV HELPERS ================
+# ======================== CSV HELPERS ========================
 def read_csv_rows(csv_path: Path) -> List[dict]:
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -182,11 +186,11 @@ def coerce_display_rows(rows: List[dict]) -> List[dict]:
 
 def default_cols_for(category: str, rows: List[dict]) -> List[str]:
     base = {
-        "overview":     ["name","province_count","total_development","income","manpower","army_quality_score"],
+        "overview":     ["name","province_count","total_development","avg_development","income","manpower","army_quality_score"],
         "economy":      ["name","income","treasury","inflation","loans","interest","war_exhaustion","corruption"],
         "military":     ["name","army_quality_score","manpower","max_manpower","land_forcelimit",
                          "army_tradition","army_professionalism","discipline","land_morale"],
-        "development":  ["name","total_development","province_count","avg_development"],
+        "development":  ["name","total_development","avg_development","province_count"],
         "technology":   ["name","mil_tech","adm_tech","dip_tech"],
         "legitimacy":   ["name","absolutism","legitimacy","republican_tradition","devotion",
                          "horde_unity","meritocracy","government_reform_progress","prestige","stability"],
@@ -247,7 +251,7 @@ class ColumnPicker(discord.ui.Select):
     def __init__(self, category: str, rows_original: List[dict], default_key: Optional[str]):
         options = []
         nums = numeric_columns(rows_original, [])
-        for c in nums[:25]:  # Discord limit
+        for c in nums[:25]:
             options.append(discord.SelectOption(label=c, value=c, default=(c == default_key)))
         super().__init__(placeholder="Sort by…", min_values=1, max_values=1, options=options)
         self.category = category
@@ -270,45 +274,42 @@ class ColumnPickerView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(ColumnPicker(category, rows_original, default_key))
 
-# ================ HEAVY WORK (lazy) ================
-async def run_eu4_viewer(save_path: Path, workdir: Path) -> bool:
-    """Run generator in a subprocess. Keep only map + CSVs; delete the save afterwards."""
-    if not EU4_SCRIPT.exists():
-        raise FileNotFoundError(f"Cannot find eu4_viewer.py at {EU4_SCRIPT}")
+# ======================== HEAVY WORK (separate process) ========================
+def build_outputs(save_path: str, workdir: str) -> dict:
+    """
+    Runs eu4_viewer.py on save_path, writes outputs into workdir, returns paths.
+    This runs inside a separate process (ProcessPoolExecutor) to keep bot RAM/CPU low.
+    """
+    wd = Path(workdir)
+    wd.mkdir(parents=True, exist_ok=True)
+    out_png = wd / "world_map.png"
 
-    out_map = workdir / "world_map.png"
-    cmd = [
-        "python3",
-        str(EU4_SCRIPT),
-        str(save_path),
-        "--assets", str(ASSETS_DIR),
-        "--out", str(out_map),
-    ]
+    script = EU4_SCRIPT
+    assets = ASSETS_DIR
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(ASSETS_DIR),
-        stdout=asyncio.subprocess.DEVNULL,   # save RAM/CPU on logs
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await proc.communicate()
+    log_path = wd / "build.log"
+    with log_path.open("w") as log:
+        subprocess.run(
+            [sys.executable, str(script), save_path, "--assets", str(assets), "--out", str(out_png)],
+            stdout=log, stderr=log, check=True
+        )
 
-    # Copy CSVs to workdir, then delete save
-    generated = out_map.exists()
-    for meta in CATEGORIES.values():
-        src = ASSETS_DIR / meta["file"]
-        if src.exists():
-            (workdir / meta["file"]).write_bytes(src.read_bytes())
-            generated = True
+    csvs = {}
+    for name in CATEGORIES.keys():
+        p = assets / f"{name}.csv"
+        if p.exists():
+            # copy CSVs into workdir, so each guild has its own snapshot
+            dest = wd / p.name
+            shutil.copy2(p, dest)
+            csvs[name] = str(dest)
 
-    try: save_path.unlink(missing_ok=True)
+    # delete the uploaded save to save space
+    try: Path(save_path).unlink(missing_ok=True)
     except Exception: pass
 
-    mark_touch(workdir)
-    auto_purge()
-    return generated
+    return {"map": str(out_png), "csvs": csvs, "log": str(log_path)}
 
-# ================ COMMANDS ================
+# ======================== COMMANDS ========================
 @bot.event
 async def on_ready():
     try:
@@ -319,39 +320,84 @@ async def on_ready():
     janitor.start()
     print(f"Logged in as {bot.user} (id={bot.user.id})")
 
-@bot.tree.command(name="submit_save", description="Upload a EU4 save; I'll render the map and generate stats tables.")
+@bot.tree.command(name="submit_save", description="Upload a EU4 save; I’ll render the map + stats tables.")
 @app_commands.describe(savefile="Attach a .eu4 save file")
 async def submit_save_cmd(interaction: discord.Interaction, savefile: discord.Attachment):
+    global PENDING_JOBS
     await interaction.response.defer(thinking=True, ephemeral=False)
+
+    if savefile.size > MAX_SAVE_MB * 1024 * 1024:
+        return await interaction.edit_original_response(
+            content=f"❌ Save is too large for this free plan (>{MAX_SAVE_MB} MB).")
 
     guild_id = interaction.guild_id or interaction.user.id
     workdir = workdir_for_guild(guild_id)
     LATEST_WORKDIR[guild_id] = workdir
 
-    save_path = workdir / (savefile.filename or "save.eu4")
-    await savefile.save(fp=save_path)
+    job_id = uuid.uuid4().hex[:8]
+    local_path = workdir / f"{job_id}_{savefile.filename}"
+    await interaction.edit_original_response(content=f"📥 Downloading `{savefile.filename}` …")
+    await savefile.save(local_path)
 
-    # Try immediate acquire; if busy, notify queueing
-    acquired_immediately = JOB_SEM.locked() is False
-    if not acquired_immediately:
-        await interaction.followup.send("⏳ Server is busy with another save. Your job is **queued** and will run shortly…")
+    # Queue note
+    queued_note = ""
+    if JOB_SEM.locked() or RUNNING_JOBS >= MAX_CONCURRENCY:
+        PENDING_JOBS += 1
+        queued_note = f"\n⏳ Server is busy. Your job is **queued** (Position ~{PENDING_JOBS})."
+
+    await interaction.edit_original_response(content=f"🧮 Parsing & rendering…{queued_note}")
 
     async def _do_job():
+        global RUNNING_JOBS, PENDING_JOBS
         async with JOB_SEM:
-            ok = await run_eu4_viewer(save_path, workdir)
+            if PENDING_JOBS > 0:
+                PENDING_JOBS -= 1
+            RUNNING_JOBS += 1
+            try:
+                loop = asyncio.get_running_loop()
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(EXEC, build_outputs, str(local_path), str(workdir)),
+                    timeout=900  # 15 minutes hard cap
+                )
+            except asyncio.TimeoutError:
+                await interaction.followup.send("⏱️ Timed out building this save (15 min). Try a smaller file.")
+                return
+            except subprocess.CalledProcessError:
+                await interaction.followup.send("❌ Failed while generating outputs. Check your assets or try another save.")
+                return
+            except Exception as e:
+                await interaction.followup.send(f"❌ Unexpected error: {type(e).__name__}: {e}")
+                return
+            finally:
+                RUNNING_JOBS -= 1
+                mark_touch(workdir)
+                auto_purge()
+
+            # Send map
             files = []
-            map_file = workdir / "world_map.png"
+            map_file = Path(result["map"])
             if map_file.exists():
                 files.append(discord.File(str(map_file), filename="world_map.png"))
-            msg = "✅ Processed your save." if ok else "⚠️ I couldn't generate outputs — try again."
+            msg = "✅ Processed your save."
             await interaction.followup.send(msg, files=files if files else None)
 
-    # Run in background so other commands remain responsive
-    asyncio.create_task(_do_job())
+            # Notify tables ready
+            await interaction.followup.send(
+                "📊 Tables updated. Try `/table category:overview` (or economy, military, development, technology, legitimacy).",
+                ephemeral=False
+            )
 
-    # If we acquired immediately, we still need to tell the user something now
-    if acquired_immediately:
-        await interaction.followup.send("▶️ Starting processing… (you’ll see the results here)")
+            # Keep only latest 3 job artifacts per guild
+            try:
+                all_items = sorted(workdir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+                job_dirs = [p for p in all_items if p.is_dir()]
+                for d in job_dirs[3:]:
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+    # Kick background task so the event loop stays responsive
+    asyncio.create_task(_do_job())
 
 @bot.tree.command(name="map", description="Send the last rendered world map for this server.")
 async def map_cmd(interaction: discord.Interaction):
@@ -361,7 +407,12 @@ async def map_cmd(interaction: discord.Interaction):
         return await interaction.response.send_message("No processed save yet. Use **/submit_save** first.")
     path = workdir / "world_map.png"
     if not path.exists():
-        return await interaction.response.send_message("I couldn't find a map for the last run.")
+        # fallback: find any map in workdir
+        maps = list(workdir.glob("**/world_map.png"))
+        if maps:
+            path = maps[0]
+        else:
+            return await interaction.response.send_message("I couldn't find a map for the last run.")
     mark_touch(workdir)
     await interaction.response.send_message(file=discord.File(str(path), filename="world_map.png"))
 
@@ -370,7 +421,7 @@ async def categories_cmd(interaction: discord.Interaction):
     cats = ", ".join(CATEGORIES.keys())
     await interaction.response.send_message(f"Available categories: **{cats}**")
 
-@bot.tree.command(name="table", description="Show a top-N table; sorted by the first numeric column. Use the dropdown to change.")
+@bot.tree.command(name="table", description="Show a top-N table; sorted by the first numeric column (dropdown to change).")
 @app_commands.describe(
     category="Which table (overview, economy, military, development, technology, legitimacy)",
     limit=f"How many rows (default {DEFAULT_TABLE_LIMIT}, max 100)"
@@ -382,9 +433,13 @@ async def table_cmd(interaction: discord.Interaction, category: app_commands.Cho
     workdir = LATEST_WORKDIR.get(guild_id)
     if not workdir:
         return await interaction.followup.send("No processed save yet. Use **/submit_save** first.")
+
+    # Prefer CSVs copied into workdir by build_outputs; else fallback to assets
     csv_path = workdir / CATEGORIES[category.value]["file"]
     if not csv_path.exists():
-        return await interaction.followup.send(f"I couldn't find `{csv_path.name}`. Please run **/submit_save** again.")
+        csv_path = ASSETS_DIR / CATEGORIES[category.value]["file"]
+        if not csv_path.exists():
+            return await interaction.followup.send(f"I couldn't find `{CATEGORIES[category.value]['file']}`. Please run **/submit_save** again.")
 
     rows = read_csv_rows(csv_path)
     if not rows:
@@ -401,14 +456,18 @@ async def table_cmd(interaction: discord.Interaction, category: app_commands.Cho
     mark_touch(workdir)
     await interaction.followup.send(f"**{category.value.capitalize()} — Top {n} (sorted by {sort_key or '—'})**\n{table_txt}", view=view)
 
-@bot.tree.command(name="status", description="Show storage usage and retention policy.")
+@bot.tree.command(name="status", description="Show storage usage, retention, and concurrency.")
 async def status_cmd(interaction: discord.Interaction):
     total = current_total_bytes()
     await interaction.response.send_message(
         f"Storage: **{human_bytes(total)}** across {len(all_workdirs())} servers.\n"
         f"Retention: **{RETENTION_HOURS}h**, Cap: **{MAX_TOTAL_STORAGE_MB} MB**.\n"
-        f"Concurrency: **{MAX_CONCURRENCY}** (increase with env var MAX_CONCURRENCY, but beware RAM/CPU)."
+        f"Concurrency: **{MAX_CONCURRENCY}** (change via env var). Current: running={RUNNING_JOBS}, queued={PENDING_JOBS}."
     )
+
+@bot.tree.command(name="queue", description="Show how many jobs are running/queued.")
+async def queue_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Jobs — running: **{RUNNING_JOBS}**, queued: **{PENDING_JOBS}**.")
 
 @bot.tree.command(name="purge", description="Delete the last processed outputs for this server.")
 async def purge_cmd(interaction: discord.Interaction):
@@ -418,7 +477,7 @@ async def purge_cmd(interaction: discord.Interaction):
     LATEST_WORKDIR.pop(guild_id, None)
     await interaction.response.send_message("🧹 Purged this server's outputs.")
 
-# ================ HTTP HEALTH (for Render Web Service) ================
+# ======================== HTTP HEALTH (Render Web Service) ========================
 async def health(_request):
     return web.Response(text="OK")
 
@@ -432,13 +491,12 @@ async def run_web_server():
     await site.start()
     print(f"HTTP health server running on :{port}")
 
-# ================ ENTRYPOINT ================
+# ======================== ENTRYPOINT ========================
 async def main_async():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Set DISCORD_TOKEN environment variable.")
     WORKDIR_ROOT.mkdir(parents=True, exist_ok=True)
-    # start HTTP server + Discord bot concurrently
     http_task = asyncio.create_task(run_web_server())
     bot_task = asyncio.create_task(bot.start(token))
     await asyncio.gather(http_task, bot_task)
