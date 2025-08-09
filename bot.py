@@ -289,10 +289,14 @@ def build_outputs(save_path: str, workdir: str) -> dict:
 
     log_path = wd / "build.log"
     with log_path.open("w") as log:
-        subprocess.run(
-            [sys.executable, str(script), save_path, "--assets", str(assets), "--out", str(out_png)],
-            stdout=log, stderr=log, check=True
-        )
+        subprocess.run([
+        "python", "eu4_viewer.py",
+        save_path,
+        "--assets", ".",
+        "--out", "world_map.png",
+        "--chunk", "64",
+        "--scale", "0.75"
+    ])
 
     csvs = {}
     for name in CATEGORIES.keys():
