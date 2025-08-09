@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-eu4_viewer.py — low-RAM, fast renderer
+eu4_viewer.py — chunked, low-RAM renderer (memmap + two-pass coastal)
 - Reads compressed .eu4 (gamestate) or plaintext
-- Builds CSVs (overview/economy/military/development/technology/legitimacy)
-- Renders world map with a 24-bit RGB→color LUT (fast & ~120MB total RAM)
+- Builds CSVs: overview/economy/military/development/technology/legitimacy
+- Renders map in chunks to disk-backed numpy.memmap (tiny RAM usage)
 """
 
-import argparse, csv, re, zipfile
+import argparse, csv, re, zipfile, os, tempfile, shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -15,12 +15,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-# -------- CLI --------
+# -------------------- CLI --------------------
 def parse_args():
-    ap = argparse.ArgumentParser(description="EU4 save → CSVs + world map")
+    ap = argparse.ArgumentParser(description="EU4 save → CSVs + world map (low RAM)")
     ap.add_argument("save", help=".eu4 save (compressed or plaintext)")
     ap.add_argument("--assets", default=".", help="Dir with provinces.bmp, definition.csv, default.map, 00_country_colors.txt")
     ap.add_argument("--out", default="world_map.png", help="Output PNG")
+    ap.add_argument("--chunk", type=int, default=128, help="Chunk height in rows (default 128)")
+    ap.add_argument("--scale", type=float, default=1.0, help="Downscale factor (e.g., 0.5). 1.0 = native size")
     return ap.parse_args()
 
 ASSET = {
@@ -28,14 +30,14 @@ ASSET = {
     "definition_csv": "definition.csv",
     "default_map": "default.map",
     "colors_txt": "00_country_colors.txt",
-    "country_names": "country_names.csv",  # optional
+    "country_names": "country_names.csv",  # optional (TAG,Name)
 }
 
 DEEP_OCEAN  = (24, 66, 140)
 COASTAL_SEA = (54, 149, 255)
 UNOCCUPIED  = (160, 160, 160)
 
-# -------- Paradox text helpers --------
+# -------------------- Paradox text helpers --------------------
 _comment = re.compile(r"(?m)^\s*#.*$")
 def strip_comments(s: str) -> str: return _comment.sub("", s)
 
@@ -103,7 +105,7 @@ def parse_block_to_dict(s: str) -> dict:
     for k, v in tokenize_kv(body): out[k] = parse_scalar(v)
     return out
 
-# -------- Save reading --------
+# -------------------- Save reading --------------------
 def read_save_text(path: Path) -> str:
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
@@ -111,7 +113,7 @@ def read_save_text(path: Path) -> str:
                 return f.read().decode("latin-1", "ignore")
     return path.read_text(encoding="latin-1", errors="ignore")
 
-# -------- Minimal parse (countries + provinces we need) --------
+# -------------------- Parse minimal model --------------------
 def parse_save_minimal(save_text: str) -> dict:
     txt = strip_comments(save_text)
     countries = {}
@@ -162,7 +164,7 @@ def parse_save_minimal(save_text: str) -> dict:
 
     return {"countries": countries, "provinces": provinces}
 
-# -------- CSVs --------
+# -------------------- CSVs --------------------
 def num(d, *keys, default=None):
     for k in keys:
         v = d.get(k)
@@ -258,7 +260,7 @@ def write_all_csvs(parsed: dict, assets_dir: Path, name_csv: Optional[Path] = No
     W("technology.csv",  ["tag","name","adm_tech","dip_tech","mil_tech"], "technology")
     W("legitimacy.csv",  ["tag","name","absolutism","legitimacy","republican_tradition","devotion","horde_unity","meritocracy","government_reform_progress","prestige","stability"], "legitimacy")
 
-# -------- Assets --------
+# -------------------- Assets --------------------
 def load_definition_csv(path: Path) -> Dict[Tuple[int,int,int], int]:
     lut = {}
     with path.open("r", encoding="latin-1") as f:
@@ -307,82 +309,176 @@ def tag_random_color(tag: str) -> Tuple[int,int,int]:
     h = hash(tag) & 0xFFFFFF
     return ((h>>16)&255, (h>>8)&255, h&255)
 
-# -------- Map renderer (24-bit LUT) --------
+# -------------------- Rendering (chunked memmap) --------------------
 def pack_rgb_uint32(arr: np.ndarray) -> np.ndarray:
     return (arr[:,:,0].astype(np.uint32)<<16) | (arr[:,:,1].astype(np.uint32)<<8) | arr[:,:,2].astype(np.uint32)
 
-def render_map(provinces_bmp: Path, definition_csv: Path, default_map: Path, parsed: dict,
-               colors_txt: Optional[Path], out_path: Path) -> None:
+def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: Path, parsed: dict,
+                       colors_txt: Optional[Path], out_path: Path, chunk_h: int = 128, scale: float = 1.0) -> None:
     im = Image.open(provinces_bmp).convert("RGB")
-    arr = np.array(im, dtype=np.uint8)            # HxWx3
-    H, W, _ = arr.shape
+    W, H = im.size  # PIL uses (W, H)
+    # temp directory for memmaps
+    tmpdir = Path(tempfile.mkdtemp(prefix="eu4map_"))
+    try:
+        # memmaps: RGB output and land/sea classification
+        mm_rgb = np.memmap(tmpdir / "rgb.dat", dtype=np.uint8, mode="w+", shape=(H, W, 3))
+        mm_land = np.memmap(tmpdir / "land.dat", dtype=np.bool_, mode="w+", shape=(H, W))
+        mm_sea  = np.memmap(tmpdir / "sea.dat",  dtype=np.bool_, mode="w+", shape=(H, W))
 
-    rgb2id = load_definition_csv(definition_csv)
-    dm = parse_default_map(default_map)
-    sea_ids = dm.get("sea_starts", set())
-    tag_colors = parse_country_colors(colors_txt) if colors_txt else {}
-    owners = {pid: d.get("owner") for pid, d in parsed["provinces"].items()}
+        rgb2id = load_definition_csv(definition_csv)
+        dm = parse_default_map(default_map)
+        sea_ids = dm.get("sea_starts", set())
+        tag_colors = parse_country_colors(colors_txt) if colors_txt else {}
+        owners = {pid: d.get("owner") for pid, d in parsed["provinces"].items()}
 
-    def color_for_tag(tag: Optional[str]) -> Tuple[int,int,int]:
-        if not tag: return UNOCCUPIED
-        return tag_colors.get(tag, tag_random_color(tag))
+        # small cache: rgb_code -> final_color + flags (to avoid dict lookups repeatedly)
+        cache_color: Dict[int, Tuple[int,int,int]] = {}
+        cache_is_sea: Dict[int, bool] = {}
+        cache_is_unocc: Dict[int, bool] = {}
 
-    # Build 24-bit LUT: (16777216, 3) uint8; initialize to UNOCCUPIED
-    lut = np.empty((1<<24, 3), dtype=np.uint8)
-    lut[:] = np.array(UNOCCUPIED, dtype=np.uint8)
+        def color_for_tag(tag: Optional[str]) -> Tuple[int,int,int]:
+            if not tag: return UNOCCUPIED
+            return tag_colors.get(tag, tag_random_color(tag))
 
-    # Pre-fill LUT for all known province colors
-    for (r,g,b), pid in rgb2id.items():
-        if pid in sea_ids:
-            lut[(r<<16)|(g<<8)|b] = np.array(DEEP_OCEAN, dtype=np.uint8)
-        else:
-            tag = owners.get(pid)
-            lut[(r<<16)|(g<<8)|b] = np.array(color_for_tag(tag), dtype=np.uint8)
+        # Pass 1: paint colors & record land/sea/unocc
+        for y0 in range(0, H, chunk_h):
+            y1 = min(y0 + chunk_h, H)
+            tile = np.array(im.crop((0, y0, W, y1)), dtype=np.uint8)  # (h, W, 3)
+            codes = pack_rgb_uint32(tile)
 
-    # Map image in one go
-    packed = pack_rgb_uint32(arr)                 # HxW uint32
-    out = lut[packed]                             # HxW x 3
+            out_tile = np.empty_like(tile)
+            land_tile = np.zeros((y1 - y0, W), dtype=np.bool_)
+            sea_tile  = np.zeros((y1 - y0, W), dtype=np.bool_)
 
-    # Land/sea masks for coastal tint
-    sea_mask = (out[:,:,0]==DEEP_OCEAN[0]) & (out[:,:,1]==DEEP_OCEAN[1]) & (out[:,:,2]==DEEP_OCEAN[2])
-    land_mask = ~sea_mask & ~(
-        (out[:,:,0]==UNOCCUPIED[0]) & (out[:,:,1]==UNOCCUPIED[1]) & (out[:,:,2]==UNOCCUPIED[2])
-    )
-    neighbors = (
-        np.pad(land_mask[1: ,:], ((0,1),(0,0))) |
-        np.pad(land_mask[:-1,:], ((1,0),(0,0))) |
-        np.pad(land_mask[:, 1:], ((0,0),(0,1))) |
-        np.pad(land_mask[:, :-1],((0,0),(1,0)))
-    )
-    coastal = sea_mask & neighbors
-    out[coastal] = np.array(COASTAL_SEA, dtype=np.uint8)
+            # Vectorized over unique codes in this tile
+            uniq = np.unique(codes)
+            # Build per-unique result then apply
+            code_to_color = {}
+            code_to_is_sea = {}
+            code_to_is_unocc = {}
 
-    # Save (palette) to reduce memory & size
-    Image.fromarray(out, mode="RGB").convert("P", palette=Image.Palette.ADAPTIVE, colors=256).save(out_path, optimize=True)
+            for code in uniq:
+                code_int = int(code)
+                if code_int in cache_color:
+                    col = cache_color[code_int]
+                    is_sea = cache_is_sea[code_int]
+                    is_un = cache_is_unocc[code_int]
+                else:
+                    r = (code_int >> 16) & 255
+                    g = (code_int >> 8) & 255
+                    b = code_int & 255
+                    pid = rgb2id.get((r,g,b))
+                    if pid is None:
+                        col = UNOCCUPIED; is_sea = False; is_un = True
+                    elif pid in sea_ids:
+                        col = DEEP_OCEAN; is_sea = True; is_un = False
+                    else:
+                        tag = owners.get(pid)
+                        col = color_for_tag(tag)
+                        is_sea = False
+                        is_un = (tag is None)
+                    cache_color[code_int] = col
+                    cache_is_sea[code_int] = is_sea
+                    cache_is_unocc[code_int] = is_un
 
-# -------- Main --------
+                code_to_color[code_int] = col
+                code_to_is_sea[code_int] = is_sea
+                code_to_is_unocc[code_int] = is_un
+
+            # Apply to tile
+            # Build mapping arrays via vectorization
+            # Map R,G,B separately
+            rmap = np.vectorize(lambda c: code_to_color[int(c)][0], otypes=[np.uint8])(codes)
+            gmap = np.vectorize(lambda c: code_to_color[int(c)][1], otypes=[np.uint8])(codes)
+            bmap = np.vectorize(lambda c: code_to_color[int(c)][2], otypes=[np.uint8])(codes)
+            out_tile[:,:,0] = rmap
+            out_tile[:,:,1] = gmap
+            out_tile[:,:,2] = bmap
+
+            sea_tile[:,:]  = np.vectorize(lambda c: code_to_is_sea[int(c)], otypes=[np.bool_])(codes)
+            unocc_tile     = np.vectorize(lambda c: code_to_is_unocc[int(c)], otypes=[np.bool_])(codes)
+            land_tile[:,:] = (~sea_tile) & (~unocc_tile)
+
+            mm_rgb[y0:y1, :, :] = out_tile
+            mm_land[y0:y1, :] = land_tile
+            mm_sea[y0:y1, :] = sea_tile
+
+        mm_rgb.flush(); mm_land.flush(); mm_sea.flush()
+
+        # Pass 2: coastal tint on sea adjacent to land (4-neighbor)
+        # We process row stripes with ±1 neighbor rows
+        for y0 in range(0, H, chunk_h):
+            y1 = min(y0 + chunk_h, H)
+            # Grab masks with one-row padding if available
+            y0m = max(0, y0 - 1)
+            y1p = min(H, y1 + 1)
+            land = np.array(mm_land[y0m:y1p, :], copy=False)
+            sea  = np.array(mm_sea[y0m:y1p, :], copy=False)
+
+            # Build neighbors on the center region (exclude extra rows in padding)
+            top = 1 if y0m < y0 else 0
+            bottom = land.shape[0] - 1 if y1p > y1 else land.shape[0] - 1
+
+            center_land = land[top: top + (y1 - y0), :]
+            center_sea  = sea [top: top + (y1 - y0), :]
+
+            # neighbor OR (up/down/left/right) using slicing
+            up    = land[top-1: top-1 + (y1 - y0), :] if top-1 >= 0 else np.zeros_like(center_land)
+            down  = land[top+1: top+1 + (y1 - y0), :] if (top+1 + (y1 - y0)) <= land.shape[0] else np.zeros_like(center_land)
+            left  = np.pad(center_land[:, :-1], ((0,0),(1,0)))
+            right = np.pad(center_land[:, 1:],  ((0,0),(0,1)))
+            near_land = center_sea & (up | down | left | right)
+
+            # Apply coastal color on mm_rgb in place
+            tile_rgb = np.array(mm_rgb[y0:y1, :, :], copy=False)
+            tile_rgb[near_land] = np.array(COASTAL_SEA, dtype=np.uint8)
+
+            mm_rgb.flush()
+
+        # Save final image (optionally scaled), as palettized PNG
+        final = np.array(mm_rgb, copy=False)
+        img = Image.fromarray(final, mode="RGB")
+        if scale and abs(scale - 1.0) > 1e-6:
+            new_w = max(1, int(img.width * scale))
+            new_h = max(1, int(img.height * scale))
+            img = img.resize((new_w, new_h), resample=Image.NEAREST)
+        img = img.convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+        img.save(out_path, optimize=True)
+    finally:
+        # Cleanup temp memmap files
+        try: shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception: pass
+
+# -------------------- Main --------------------
 def main():
     args = parse_args()
     assets = Path(args.assets).resolve()
     save_path = Path(args.save).resolve()
     out_path = Path(args.out).resolve()
 
+    for req in ("provinces_bmp", "definition_csv", "default_map"):
+        p = assets / ASSET[req]
+        if not p.exists():
+            raise SystemExit(f"Missing asset: {p}")
+
     # Read save (compressed or plaintext)
     save_text = read_save_text(save_path)
     parsed = parse_save_minimal(save_text)
 
-    # Write CSVs
+    # CSVs
     write_all_csvs(parsed, assets_dir=assets)
 
-    # Render map
-    provinces_bmp = assets / ASSET["provinces_bmp"]
-    definition_csv = assets / ASSET["definition_csv"]
-    default_map = assets / ASSET["default_map"]
-    colors_txt = assets / ASSET["colors_txt"]
-    for p in (provinces_bmp, definition_csv, default_map):
-        if not p.exists(): raise SystemExit(f"Missing asset: {p}")
-
-    render_map(provinces_bmp, definition_csv, default_map, parsed, colors_txt if colors_txt.exists() else None, out_path)
+    # Map (chunked, memmapped)
+    render_map_chunked(
+        provinces_bmp=assets / ASSET["provinces_bmp"],
+        definition_csv=assets / ASSET["definition_csv"],
+        default_map=assets / ASSET["default_map"],
+        parsed=parsed,
+        colors_txt=(assets / ASSET["colors_txt"] if (assets / ASSET["colors_txt"]).exists() else None),
+        out_path=out_path,
+        chunk_h=max(32, min(args.chunk, 512)),
+        scale=max(0.25, min(args.scale, 1.0))  # keep within reasonable bounds
+    )
     print(f"[OK] Map → {out_path}\n[OK] CSVs → {assets}")
 
 if __name__ == "__main__":
