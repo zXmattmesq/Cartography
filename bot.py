@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import csv
 import math
@@ -11,12 +12,13 @@ from typing import Dict, List, Optional
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from aiohttp import web
 
 # ======================== CONFIG ========================
 ASSETS_DIR = Path(__file__).parent.resolve()
 EU4_SCRIPT = ASSETS_DIR / "eu4_viewer.py"
 
-# CSV categories produced by your script
+# CSV categories produced by eu4_viewer.py
 CATEGORIES = {
     "overview":     {"file": "overview.csv"},
     "economy":      {"file": "economy.csv"},
@@ -26,25 +28,29 @@ CATEGORIES = {
     "legitimacy":   {"file": "legitimacy.csv"},
 }
 
-# Optional tag->name mapping (tag,name)
+# Optional tag->name mapping (file with lines: TAG,Name)
 COUNTRY_NAMES_FILE = ASSETS_DIR / "country_names.csv"
 
 # Table defaults
 DEFAULT_TABLE_LIMIT = 10
 
-# Storage/cleanup policy (tweak with env vars on Render)
-RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "8"))          # auto-delete outputs older than this
-MAX_TOTAL_STORAGE_MB = int(os.getenv("MAX_TOTAL_STORAGE_MB", "300"))  # cap all outputs across all guilds
+# Storage/cleanup policy (tweak via Render env vars)
+RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "8"))               # auto-delete outputs older than this
+MAX_TOTAL_STORAGE_MB = int(os.getenv("MAX_TOTAL_STORAGE_MB", "300"))    # total cap across all guilds
 WORKDIR_ROOT = Path(os.getenv("WORKDIR_ROOT", tempfile.gettempdir())) / "eu4bot_runs"
 
-# Discord intents (no privileged needed for slash commands)
+# Concurrency cap (keep low for Render free plan)
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
+JOB_SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
+
+# Discord (slash commands only; no privileged intents needed)
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Last processed workspace per guild
 LATEST_WORKDIR: Dict[int, Path] = {}
 
-# ======================== STORAGE MANAGER ========================
+# ================ STORAGE MANAGER ================
 def dir_size_bytes(path: Path) -> int:
     total = 0
     for p in path.rglob("*"):
@@ -82,26 +88,25 @@ def current_total_bytes() -> int:
     return sum(dir_size_bytes(p) for p in all_workdirs())
 
 def auto_purge() -> None:
-    """Purge by age then by LRU to stay under MAX_TOTAL_STORAGE_MB."""
-    # Age-based purge
+    """Purge by age first; then LRU until under size cap."""
     cutoff = time.time() - RETENTION_HOURS * 3600
     for wd in all_workdirs():
         try:
-            mt = wd.stat().st_mtime
-            if mt < cutoff:
+            if wd.stat().st_mtime < cutoff:
                 purge_dir(wd)
         except Exception:
             purge_dir(wd)
 
-    # Size-based purge
     max_bytes = MAX_TOTAL_STORAGE_MB * 1024 * 1024
     total = current_total_bytes()
     if total <= max_bytes:
         return
 
-    # Sort remaining by last modified (oldest first)
-    remaining = [(p.stat().st_mtime, p) for p in all_workdirs()]
-    remaining.sort(key=lambda x: x[0])
+    remaining = []
+    for p in all_workdirs():
+        try: remaining.append((p.stat().st_mtime, p))
+        except Exception: purge_dir(p)
+    remaining.sort(key=lambda x: x[0])  # oldest first
     for _, p in remaining:
         if current_total_bytes() <= max_bytes:
             break
@@ -111,7 +116,7 @@ def auto_purge() -> None:
 async def janitor():
     auto_purge()
 
-# ======================== COUNTRY NAMES ========================
+# ================ COUNTRY NAMES ================
 def load_country_name_map() -> Dict[str, str]:
     m: Dict[str, str] = {}
     if COUNTRY_NAMES_FILE.exists():
@@ -123,23 +128,21 @@ def load_country_name_map() -> Dict[str, str]:
                 if len(tag) == 3 and name:
                     m[tag] = name
     return m
-
 TAG_TO_NAME = load_country_name_map()
 
 def best_country_name(row: dict) -> str:
     tag = (row.get("tag") or "").upper()
     if tag in TAG_TO_NAME:
         return TAG_TO_NAME[tag]
-    # Prefer stable fields if your generator writes them
     for key in ("country_name", "localized_name", "long_name"):
-        if row.get(key): return str(row[key])[:40]
-    # Fall back to CSV 'name' if not obviously a ruler
+        if row.get(key):
+            return str(row[key])[:40]
     n = (row.get("name") or "").strip()
     if n and len(n) <= 24 and not any(ch.isdigit() for ch in n):
         return n
     return tag or "Unknown"
 
-# ======================== CSV HELPERS ========================
+# ================ CSV HELPERS ================
 def read_csv_rows(csv_path: Path) -> List[dict]:
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -219,7 +222,6 @@ def monospace_table(rows: List[dict], cols: List[str], limit: int) -> str:
         except Exception:
             return str(x)
 
-    # clamp name width
     for r in rows:
         if "name" in r and r["name"]:
             r["name"] = str(r["name"])[:22]
@@ -240,12 +242,12 @@ def monospace_table(rows: List[dict], cols: List[str], limit: int) -> str:
         lines.append(" ".join(f"{fmt(r.get(c)):<{widths[c]}}" for c in cols))
     return "```\n" + "\n".join(lines) + "\n```"
 
-# ============== Column picker UI (for resorting on the fly) ==============
+# ============== Column picker UI ==============
 class ColumnPicker(discord.ui.Select):
     def __init__(self, category: str, rows_original: List[dict], default_key: Optional[str]):
         options = []
         nums = numeric_columns(rows_original, [])
-        for c in nums[:25]:
+        for c in nums[:25]:  # Discord limit
             options.append(discord.SelectOption(label=c, value=c, default=(c == default_key)))
         super().__init__(placeholder="Sort by…", min_values=1, max_values=1, options=options)
         self.category = category
@@ -268,7 +270,7 @@ class ColumnPickerView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(ColumnPicker(category, rows_original, default_key))
 
-# ======================== HEAVY WORK (lazy) ========================
+# ================ HEAVY WORK (lazy) ================
 async def run_eu4_viewer(save_path: Path, workdir: Path) -> bool:
     """Run generator in a subprocess. Keep only map + CSVs; delete the save afterwards."""
     if not EU4_SCRIPT.exists():
@@ -286,7 +288,7 @@ async def run_eu4_viewer(save_path: Path, workdir: Path) -> bool:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(ASSETS_DIR),
-        stdout=asyncio.subprocess.DEVNULL,   # no RAM spent on logs
+        stdout=asyncio.subprocess.DEVNULL,   # save RAM/CPU on logs
         stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.communicate()
@@ -299,7 +301,6 @@ async def run_eu4_viewer(save_path: Path, workdir: Path) -> bool:
             (workdir / meta["file"]).write_bytes(src.read_bytes())
             generated = True
 
-    # Remove original save to save disk
     try: save_path.unlink(missing_ok=True)
     except Exception: pass
 
@@ -307,7 +308,7 @@ async def run_eu4_viewer(save_path: Path, workdir: Path) -> bool:
     auto_purge()
     return generated
 
-# ======================== COMMANDS ========================
+# ================ COMMANDS ================
 @bot.event
 async def on_ready():
     try:
@@ -327,19 +328,30 @@ async def submit_save_cmd(interaction: discord.Interaction, savefile: discord.At
     workdir = workdir_for_guild(guild_id)
     LATEST_WORKDIR[guild_id] = workdir
 
-    # Stream the upload directly to disk
     save_path = workdir / (savefile.filename or "save.eu4")
     await savefile.save(fp=save_path)
 
-    ok = await run_eu4_viewer(save_path, workdir)
+    # Try immediate acquire; if busy, notify queueing
+    acquired_immediately = JOB_SEM.locked() is False
+    if not acquired_immediately:
+        await interaction.followup.send("⏳ Server is busy with another save. Your job is **queued** and will run shortly…")
 
-    files = []
-    map_file = workdir / "world_map.png"
-    if map_file.exists():
-        files.append(discord.File(str(map_file), filename="world_map.png"))
+    async def _do_job():
+        async with JOB_SEM:
+            ok = await run_eu4_viewer(save_path, workdir)
+            files = []
+            map_file = workdir / "world_map.png"
+            if map_file.exists():
+                files.append(discord.File(str(map_file), filename="world_map.png"))
+            msg = "✅ Processed your save." if ok else "⚠️ I couldn't generate outputs — try again."
+            await interaction.followup.send(msg, files=files if files else None)
 
-    msg = "✅ Processed your save." if ok else "⚠️ I couldn't generate outputs — try again."
-    await interaction.followup.send(msg, files=files if files else None)
+    # Run in background so other commands remain responsive
+    asyncio.create_task(_do_job())
+
+    # If we acquired immediately, we still need to tell the user something now
+    if acquired_immediately:
+        await interaction.followup.send("▶️ Starting processing… (you’ll see the results here)")
 
 @bot.tree.command(name="map", description="Send the last rendered world map for this server.")
 async def map_cmd(interaction: discord.Interaction):
@@ -358,7 +370,7 @@ async def categories_cmd(interaction: discord.Interaction):
     cats = ", ".join(CATEGORIES.keys())
     await interaction.response.send_message(f"Available categories: **{cats}**")
 
-@bot.tree.command(name="table", description="Show a top-N table from a category; sorted by the first numeric column. Use the dropdown to change.")
+@bot.tree.command(name="table", description="Show a top-N table; sorted by the first numeric column. Use the dropdown to change.")
 @app_commands.describe(
     category="Which table (overview, economy, military, development, technology, legitimacy)",
     limit=f"How many rows (default {DEFAULT_TABLE_LIMIT}, max 100)"
@@ -394,7 +406,8 @@ async def status_cmd(interaction: discord.Interaction):
     total = current_total_bytes()
     await interaction.response.send_message(
         f"Storage: **{human_bytes(total)}** across {len(all_workdirs())} servers.\n"
-        f"Retention: **{RETENTION_HOURS}h**, Cap: **{MAX_TOTAL_STORAGE_MB} MB**."
+        f"Retention: **{RETENTION_HOURS}h**, Cap: **{MAX_TOTAL_STORAGE_MB} MB**.\n"
+        f"Concurrency: **{MAX_CONCURRENCY}** (increase with env var MAX_CONCURRENCY, but beware RAM/CPU)."
     )
 
 @bot.tree.command(name="purge", description="Delete the last processed outputs for this server.")
@@ -405,12 +418,30 @@ async def purge_cmd(interaction: discord.Interaction):
     LATEST_WORKDIR.pop(guild_id, None)
     await interaction.response.send_message("🧹 Purged this server's outputs.")
 
-# ======================== ENTRYPOINT ========================
-def main():
+# ================ HTTP HEALTH (for Render Web Service) ================
+async def health(_request):
+    return web.Response(text="OK")
+
+async def run_web_server():
+    app = web.Application()
+    app.add_routes([web.get("/", health), web.get("/healthz", health)])
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"HTTP health server running on :{port}")
+
+# ================ ENTRYPOINT ================
+async def main_async():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Set DISCORD_TOKEN environment variable.")
-    bot.run(token)
+    WORKDIR_ROOT.mkdir(parents=True, exist_ok=True)
+    # start HTTP server + Discord bot concurrently
+    http_task = asyncio.create_task(run_web_server())
+    bot_task = asyncio.create_task(bot.start(token))
+    await asyncio.gather(http_task, bot_task)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
