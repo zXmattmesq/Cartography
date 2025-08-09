@@ -1,0 +1,5 @@
+discord.py
+pillow
+pandas
+xlsxwriter
+python-dotenv
