@@ -316,11 +316,10 @@ def pack_rgb_uint32(arr: np.ndarray) -> np.ndarray:
 def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: Path, parsed: dict,
                        colors_txt: Optional[Path], out_path: Path, chunk_h: int = 128, scale: float = 1.0) -> None:
     im = Image.open(provinces_bmp).convert("RGB")
-    W, H = im.size  # PIL uses (W, H)
-    # temp directory for memmaps
+    W, H = im.size  # PIL (W, H)
+
     tmpdir = Path(tempfile.mkdtemp(prefix="eu4map_"))
     try:
-        # memmaps: RGB output and land/sea classification
         mm_rgb = np.memmap(tmpdir / "rgb.dat", dtype=np.uint8, mode="w+", shape=(H, W, 3))
         mm_land = np.memmap(tmpdir / "land.dat", dtype=np.bool_, mode="w+", shape=(H, W))
         mm_sea  = np.memmap(tmpdir / "sea.dat",  dtype=np.bool_, mode="w+", shape=(H, W))
@@ -331,7 +330,6 @@ def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: P
         tag_colors = parse_country_colors(colors_txt) if colors_txt else {}
         owners = {pid: d.get("owner") for pid, d in parsed["provinces"].items()}
 
-        # small cache: rgb_code -> final_color + flags (to avoid dict lookups repeatedly)
         cache_color: Dict[int, Tuple[int,int,int]] = {}
         cache_is_sea: Dict[int, bool] = {}
         cache_is_unocc: Dict[int, bool] = {}
@@ -340,7 +338,7 @@ def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: P
             if not tag: return UNOCCUPIED
             return tag_colors.get(tag, tag_random_color(tag))
 
-        # Pass 1: paint colors & record land/sea/unocc
+        # Pass 1: color fill + masks
         for y0 in range(0, H, chunk_h):
             y1 = min(y0 + chunk_h, H)
             tile = np.array(im.crop((0, y0, W, y1)), dtype=np.uint8)  # (h, W, 3)
@@ -350,9 +348,7 @@ def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: P
             land_tile = np.zeros((y1 - y0, W), dtype=np.bool_)
             sea_tile  = np.zeros((y1 - y0, W), dtype=np.bool_)
 
-            # Vectorized over unique codes in this tile
             uniq = np.unique(codes)
-            # Build per-unique result then apply
             code_to_color = {}
             code_to_is_sea = {}
             code_to_is_unocc = {}
@@ -385,15 +381,11 @@ def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: P
                 code_to_is_sea[code_int] = is_sea
                 code_to_is_unocc[code_int] = is_un
 
-            # Apply to tile
-            # Build mapping arrays via vectorization
-            # Map R,G,B separately
+            # map via vectorized lambdas
             rmap = np.vectorize(lambda c: code_to_color[int(c)][0], otypes=[np.uint8])(codes)
             gmap = np.vectorize(lambda c: code_to_color[int(c)][1], otypes=[np.uint8])(codes)
             bmap = np.vectorize(lambda c: code_to_color[int(c)][2], otypes=[np.uint8])(codes)
-            out_tile[:,:,0] = rmap
-            out_tile[:,:,1] = gmap
-            out_tile[:,:,2] = bmap
+            out_tile[:,:,0] = rmap; out_tile[:,:,1] = gmap; out_tile[:,:,2] = bmap
 
             sea_tile[:,:]  = np.vectorize(lambda c: code_to_is_sea[int(c)], otypes=[np.bool_])(codes)
             unocc_tile     = np.vectorize(lambda c: code_to_is_unocc[int(c)], otypes=[np.bool_])(codes)
@@ -405,37 +397,28 @@ def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: P
 
         mm_rgb.flush(); mm_land.flush(); mm_sea.flush()
 
-        # Pass 2: coastal tint on sea adjacent to land (4-neighbor)
-        # We process row stripes with ±1 neighbor rows
+        # Pass 2: coastal tint
         for y0 in range(0, H, chunk_h):
             y1 = min(y0 + chunk_h, H)
-            # Grab masks with one-row padding if available
             y0m = max(0, y0 - 1)
             y1p = min(H, y1 + 1)
             land = np.array(mm_land[y0m:y1p, :], copy=False)
             sea  = np.array(mm_sea[y0m:y1p, :], copy=False)
 
-            # Build neighbors on the center region (exclude extra rows in padding)
             top = 1 if y0m < y0 else 0
-            bottom = land.shape[0] - 1 if y1p > y1 else land.shape[0] - 1
-
             center_land = land[top: top + (y1 - y0), :]
             center_sea  = sea [top: top + (y1 - y0), :]
 
-            # neighbor OR (up/down/left/right) using slicing
             up    = land[top-1: top-1 + (y1 - y0), :] if top-1 >= 0 else np.zeros_like(center_land)
             down  = land[top+1: top+1 + (y1 - y0), :] if (top+1 + (y1 - y0)) <= land.shape[0] else np.zeros_like(center_land)
             left  = np.pad(center_land[:, :-1], ((0,0),(1,0)))
             right = np.pad(center_land[:, 1:],  ((0,0),(0,1)))
             near_land = center_sea & (up | down | left | right)
 
-            # Apply coastal color on mm_rgb in place
             tile_rgb = np.array(mm_rgb[y0:y1, :, :], copy=False)
             tile_rgb[near_land] = np.array(COASTAL_SEA, dtype=np.uint8)
-
             mm_rgb.flush()
 
-        # Save final image (optionally scaled), as palettized PNG
         final = np.array(mm_rgb, copy=False)
         img = Image.fromarray(final, mode="RGB")
         if scale and abs(scale - 1.0) > 1e-6:
@@ -445,7 +428,6 @@ def render_map_chunked(provinces_bmp: Path, definition_csv: Path, default_map: P
         img = img.convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
         img.save(out_path, optimize=True)
     finally:
-        # Cleanup temp memmap files
         try: shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception: pass
 
@@ -461,14 +443,10 @@ def main():
         if not p.exists():
             raise SystemExit(f"Missing asset: {p}")
 
-    # Read save (compressed or plaintext)
     save_text = read_save_text(save_path)
     parsed = parse_save_minimal(save_text)
-
-    # CSVs
     write_all_csvs(parsed, assets_dir=assets)
 
-    # Map (chunked, memmapped)
     render_map_chunked(
         provinces_bmp=assets / ASSET["provinces_bmp"],
         definition_csv=assets / ASSET["definition_csv"],
@@ -477,7 +455,7 @@ def main():
         colors_txt=(assets / ASSET["colors_txt"] if (assets / ASSET["colors_txt"]).exists() else None),
         out_path=out_path,
         chunk_h=max(32, min(args.chunk, 512)),
-        scale=max(0.25, min(args.scale, 1.0))  # keep within reasonable bounds
+        scale=max(0.25, min(args.scale, 1.0))
     )
     print(f"[OK] Map → {out_path}\n[OK] CSVs → {assets}")
 
