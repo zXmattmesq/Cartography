@@ -31,7 +31,7 @@ load_dotenv()
 TOKEN = os.environ.get("DISCORD_TOKEN")
 ASSETS_DIR = Path(os.environ.get("ASSETS_DIR", ".")).resolve()
 VIEWER_CHUNK = os.environ.get("VIEWER_CHUNK", "64")
-VIEWER_SCALE = os.environ.get("VIEWER_SCALE", "0.75")
+VIEWER_SCALE = os.environ.get("VIEWER_SCALE", "1.0")
 WORK_DIR = Path(os.environ.get("WORK_DIR", "data")).resolve()
 
 # If set, we sync commands to this guild immediately (faster availability)
