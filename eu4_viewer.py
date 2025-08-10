@@ -58,22 +58,32 @@ def read_text_save(save_path: Path) -> str:
 
 
 def load_definition(def_csv: Path) -> Dict[Tuple[int, int, int], int]:
-    """Map province RGB -> province id."""
+    """Map province (R,G,B) -> province id. Supports ';' or ',' delimiters."""
     mapping: Dict[Tuple[int, int, int], int] = {}
-    with def_csv.open("r", encoding="latin-1") as f:
-        rdr = csv.reader(f)
-        for row in rdr:
-            if not row or row[0].startswith("#"):  # comment
+    with def_csv.open("r", encoding="latin-1", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Some files are semicolon CSV: id;r;g;b;a;name;x;y;
+            # Others are comma CSV: id,r,g,b, ...  (mods/tools)
+            parts = line.split(";")
+            if len(parts) < 4:  # fallback to comma if not semicolon-based
+                parts = line.split(",")
+            if len(parts) < 4:
                 continue
             try:
-                pid = int(row[0])
-                r, g, b = int(row[1]), int(row[2]), int(row[3])
+                pid = int(parts[0].strip())
+                r = int(parts[1].strip())
+                g = int(parts[2].strip())
+                b = int(parts[3].strip())
             except Exception:
                 continue
             if (r, g, b) == (0, 0, 0):
                 continue
             mapping[(r, g, b)] = pid
     return mapping
+
 
 
 def parse_default_map(default_map: Path) -> Dict[str, set]:
