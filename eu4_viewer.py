@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-eu4_viewer.py  —  Minimal, robust EU4 save renderer + ledgers (low RAM)
+eu4_viewer.py — EU4 save → colored world map + ledgers (RAM-friendly)
 
-Inputs (assets dir must contain):
-- provinces.bmp
-- definition.csv
-- default.map
-- 00_country_colors.txt
+Usage:
+  python eu4_viewer.py "/path/to/save.eu4" --assets . --out world_map.png --chunk 64 --scale 0.75
 
+Requires (inside --assets):
+  - provinces.bmp
+  - definition.csv           (semicolon or comma delimited)
+  - default.map
+  - 00_country_colors.txt
 Outputs:
-- Map image (RGB) to --out
-- CSVs to --assets directory:
-  overview.csv, economy.csv, military.csv, development.csv, technology.csv, legitimacy.csv
+  - --out (PNG map)
+  - overview.csv, economy.csv, military.csv, development.csv, technology.csv, legitimacy.csv (in --assets)
 """
 
 from __future__ import annotations
 import argparse
 import csv
+import hashlib
 import io
 import os
 import re
@@ -31,30 +33,22 @@ from PIL import Image
 
 
 # ---------------------------
-# Utility / IO
+# File IO helpers
 # ---------------------------
 
 def read_text_save(save_path: Path) -> str:
     """Return the EU4 save as text (handles zipped saves)."""
     data = save_path.read_bytes()
-    # Zipped saves start with PK
-    if len(data) >= 2 and data[0:2] == b"PK":
+    if data[:2] == b"PK":  # zipped
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            # Common entry name is 'gamestate'
             name = "gamestate"
             if name not in zf.namelist():
-                # fallback: first non-meta file
-                names = [n for n in zf.namelist() if not n.endswith(".meta")]
-                if not names:
+                cand = [n for n in zf.namelist() if not n.endswith(".meta")]
+                if not cand:
                     raise RuntimeError("Zip save has no gamestate")
-                name = names[0]
-            txt = zf.read(name)
-            return txt.decode("latin-1", errors="ignore")
-    # Plain text
-    try:
-        return data.decode("latin-1", errors="ignore")
-    except Exception:
-        return data.decode("utf-8", errors="ignore")
+                name = cand[0]
+            return zf.read(name).decode("latin-1", errors="ignore")
+    return data.decode("latin-1", errors="ignore")
 
 
 def load_definition(def_csv: Path) -> Dict[Tuple[int, int, int], int]:
@@ -65,10 +59,8 @@ def load_definition(def_csv: Path) -> Dict[Tuple[int, int, int], int]:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            # Some files are semicolon CSV: id;r;g;b;a;name;x;y;
-            # Others are comma CSV: id,r,g,b, ...  (mods/tools)
             parts = line.split(";")
-            if len(parts) < 4:  # fallback to comma if not semicolon-based
+            if len(parts) < 4:
                 parts = line.split(",")
             if len(parts) < 4:
                 continue
@@ -85,29 +77,23 @@ def load_definition(def_csv: Path) -> Dict[Tuple[int, int, int], int]:
     return mapping
 
 
-
 def parse_default_map(default_map: Path) -> Dict[str, set]:
-    """Read default.map to get sea provinces and RNW sea, etc."""
-    text = default_map.read_text(encoding="latin-1", errors="ignore")
-    def _read_set(key: str) -> set:
-        m = re.search(rf"{key}\s*=\s*\{{([^}}]+)\}}", text, re.S)
+    """Read default.map for sea/only_used_for_random sets."""
+    txt = default_map.read_text(encoding="latin-1", errors="ignore")
+    def _set(key: str) -> set:
+        m = re.search(rf"{key}\s*=\s*\{{([^}}]+)\}}", txt, re.S)
         if not m:
             return set()
-        nums = re.findall(r"\d+", m.group(1))
-        return set(int(n) for n in nums)
-    return {
-        "sea": _read_set("sea_starts"),
-        "only_used_for_random": _read_set("only_used_for_random"),
-    }
+        return set(int(n) for n in re.findall(r"\d+", m.group(1)))
+    return {"sea": _set("sea_starts"), "only_used_for_random": _set("only_used_for_random")}
 
 
 def parse_country_colors(colors_txt: Path) -> Dict[str, Tuple[int, int, int]]:
-    """TAG -> color1 (r,g,b)."""
+    """TAG -> color1 (r,g,b) from 00_country_colors.txt."""
     if not colors_txt.exists():
         return {}
     txt = colors_txt.read_text(encoding="latin-1", errors="ignore")
     colors: Dict[str, Tuple[int, int, int]] = {}
-    # Blocks: TAG = { ... color1= { r g b } ... }
     tag_pat = re.compile(r"\b([A-Z0-9]{3})\s*=\s*{", re.M)
     idx = 0
     while True:
@@ -142,18 +128,16 @@ def parse_country_colors(colors_txt: Path) -> Dict[str, Tuple[int, int, int]]:
 # ---------------------------
 
 def _strip_comments(s: str) -> str:
-    out_lines = []
+    out = []
     for line in s.splitlines():
-        # remove anything after '#'
         p = line.find("#")
         if p != -1:
             line = line[:p]
-        out_lines.append(line)
-    return "\n".join(out_lines)
+        out.append(line)
+    return "\n".join(out)
 
 
 def _find_block(s: str, key: str) -> Tuple[int, int]:
-    """Return slice [start,end) of key={...} or (-1,-1)."""
     m = re.search(rf"\b{re.escape(key)}\s*=\s*{{", s)
     if not m:
         return (-1, -1)
@@ -170,44 +154,33 @@ def _find_block(s: str, key: str) -> Tuple[int, int]:
 
 
 def _block_to_dict(block: str) -> Dict[str, object]:
-    """Very small 'clausewitz' to python-ish mapping for a single block."""
     inner = block
-    # Strip outer braces
     p = inner.find("{")
     q = inner.rfind("}")
     if p != -1 and q != -1 and q > p:
         inner = inner[p + 1 : q]
-
     d: Dict[str, object] = {}
-    # Simple key = value OR key = { ... } (keep as raw string)
     tok = re.finditer(r"([A-Za-z0-9_\.]+)\s*=\s*([^\n{}]+|{[^{}]*})", inner)
     for m in tok:
         k = m.group(1)
         v = m.group(2).strip()
-        # Try number/bool
         if v.startswith("{") and v.endswith("}"):
-            d[k] = v  # keep raw
+            d[k] = v  # keep raw; we’ll dig into it if needed
         elif v in ("yes", "no", "true", "false"):
             d[k] = v in ("yes", "true")
         else:
             try:
-                if "." in v:
-                    d[k] = float(v)
-                else:
-                    d[k] = int(v)
+                d[k] = float(v) if "." in v else int(v)
             except Exception:
-                v = v.strip('"')
-                d[k] = v
+                d[k] = v.strip('"')
     return d
 
 
 def parse_save_minimal(txt: str) -> Dict[str, object]:
-    """Return dict with countries and provinces (owner & a few stats).
-       Falls back to owned_provinces when provinces block is absent.
-    """
+    """Return dict with countries and provinces (owner + a few stats)."""
     s = _strip_comments(txt)
 
-    # --- countries ---
+    # countries
     countries: Dict[str, Dict[str, object]] = {}
     a, b = _find_block(s, "countries")
     if a != -1:
@@ -237,7 +210,7 @@ def parse_save_minimal(txt: str) -> Dict[str, object]:
             countries[tag] = _block_to_dict(block)
             idx = end
 
-    # --- provinces ---
+    # provinces
     provinces: Dict[int, Dict[str, object]] = {}
     a, b = _find_block(s, "provinces")
     if a != -1:
@@ -276,44 +249,33 @@ def parse_save_minimal(txt: str) -> Dict[str, object]:
             }
             idx = end
 
-    # Fallback ownership from owned_provinces if provinces[] absent
+    # Fallback ownership from owned_provinces when provinces block is absent
     if not provinces:
         num_pat = re.compile(r"\b\d+\b")
-        owner_map: Dict[int, str] = {}
         for tag, c in countries.items():
             owned = c.get("owned_provinces")
             if isinstance(owned, str) and owned.startswith("{"):
                 for n in num_pat.findall(owned):
-                    owner_map[int(n)] = tag
-        for pid, tag in owner_map.items():
-            provinces[pid] = {
-                "owner": tag,
-                "is_city": True,
-                "colony": False,
-                "base_tax": 0.0,
-                "base_production": 0.0,
-                "base_manpower": 0.0,
-                "is_sea": False,
-            }
+                    pid = int(n)
+                    provinces[pid] = provinces.get(pid, {})
+                    provinces[pid]["owner"] = tag
 
     return {"countries": countries, "provinces": provinces}
 
 
 # ---------------------------
-# Ledger extraction
+# Ledgers
 # ---------------------------
 
-def country_display_name(tag: str, cdict: Dict[str, object]) -> str:
-    n = cdict.get("name")
-    if isinstance(n, str) and n:
-        return n
-    return tag
+def country_display_name(tag: str, c: Dict[str, object]) -> str:
+    n = c.get("name")
+    return n if isinstance(n, str) and n else tag
 
 
 def extract_ledgers(parsed: Dict[str, object]) -> Dict[str, List[Dict[str, object]]]:
     countries: Dict[str, Dict[str, object]] = parsed["countries"]  # type: ignore
-    # Aggregate province dev by owner
     provinces: Dict[int, Dict[str, object]] = parsed["provinces"]  # type: ignore
+
     dev_tot: Dict[str, float] = {}
     prov_cnt: Dict[str, int] = {}
     for pid, d in provinces.items():
@@ -326,19 +288,13 @@ def extract_ledgers(parsed: Dict[str, object]) -> Dict[str, List[Dict[str, objec
         dev_tot[tag] = dev_tot.get(tag, 0.0) + (bt + bp + bm)
         prov_cnt[tag] = prov_cnt.get(tag, 0) + 1
 
-    rows_overview = []
-    rows_econ = []
-    rows_mil = []
-    rows_dev = []
-    rows_tech = []
-    rows_leg = []
+    rows_overview, rows_econ, rows_mil, rows_dev, rows_tech, rows_leg = [], [], [], [], [], []
 
     for tag, c in countries.items():
         name = country_display_name(tag, c)
         total_dev = round(dev_tot.get(tag, 0.0), 3)
         pcount = prov_cnt.get(tag, 0)
 
-        # Common fields (best-effort; many saves omit some)
         treasury = c.get("treasury", "")
         income = c.get("income", "")
         inflation = c.get("inflation", "")
@@ -362,7 +318,7 @@ def extract_ledgers(parsed: Dict[str, object]) -> Dict[str, List[Dict[str, objec
         rows_overview.append({
             "tag": tag, "name": name,
             "province_count": pcount,
-            "total_development": round(total_dev, 3),
+            "total_development": total_dev,
             "avg_development": round(total_dev / pcount, 3) if pcount else 0,
             "income": income,
             "manpower": manpower,
@@ -387,7 +343,7 @@ def extract_ledgers(parsed: Dict[str, object]) -> Dict[str, List[Dict[str, objec
         rows_dev.append({
             "tag": tag, "name": name,
             "province_count": pcount,
-            "total_development": round(total_dev, 3),
+            "total_development": total_dev,
             "avg_development": round(total_dev / pcount, 3) if pcount else 0,
         })
 
@@ -413,7 +369,7 @@ def extract_ledgers(parsed: Dict[str, object]) -> Dict[str, List[Dict[str, objec
 
 def write_csvs(csvdir: Path, ledgers: Dict[str, List[Dict[str, object]]]) -> None:
     csvdir.mkdir(parents=True, exist_ok=True)
-    order = {
+    columns = {
         "overview": ["tag", "name", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"],
         "economy": ["tag", "name", "income", "treasury", "inflation", "loans", "interest", "war_exhaustion", "corruption"],
         "military": ["tag", "name", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"],
@@ -423,12 +379,34 @@ def write_csvs(csvdir: Path, ledgers: Dict[str, List[Dict[str, object]]]) -> Non
     }
     for key, rows in ledgers.items():
         path = csvdir / f"{key}.csv"
-        cols = order[key]
         with path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
+            w = csv.DictWriter(f, fieldnames=columns[key])
             w.writeheader()
             for r in rows:
-                w.writerow({c: r.get(c, "") for c in cols})
+                w.writerow({c: r.get(c, "") for c in columns[key]})
+
+
+# ---------------------------
+# Colors
+# ---------------------------
+
+def _parse_rgb_triplet(s: str) -> Optional[Tuple[int, int, int]]:
+    """Extract first '{ r g b }' triple from a brace string."""
+    if not isinstance(s, str):
+        return None
+    m = re.search(r"\{\s*(\d+)\s+(\d+)\s+(\d+)\s*\}", s)
+    if not m:
+        return None
+    r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    r = max(0, min(255, r)); g = max(0, min(255, g)); b = max(0, min(255, b))
+    return (r, g, b)
+
+
+def _hash_color(tag: str) -> Tuple[int, int, int]:
+    """Deterministic fallback color."""
+    h = hashlib.sha1(tag.encode("utf-8")).digest()
+    r, g, b = h[0], h[7], h[14]
+    return (60 + (r % 156), 60 + (g % 156), 60 + (b % 156))
 
 
 # ---------------------------
@@ -453,81 +431,53 @@ def render_map(
     img = Image.open(provinces_img).convert("RGB")
     W, H = img.size
 
-    if scale != 1.0:
-        W2, H2 = int(W * scale), int(H * scale)
-    else:
-        W2, H2 = W, H
-
-    # Create output buffer
-    out = np.zeros((H2, W2, 3), dtype=np.uint8)
-
-    # Helper: map province id to display color
-    def color_for_pid(pid: int, x: int, y: int, neighbor_land: bool) -> Tuple[int, int, int]:
-        if pid in sea_ids:
-            return COAST_BLUE if neighbor_land else DEEP_BLUE
-        tag = owners.get(pid)
-        if not tag:
-            return UNOWNED_GRAY
-        return country_colors.get(tag, (130, 130, 130))
-
-    # Precompute province id grid, streamed by chunks for memory
-    # Also detect if sea pixel touches land (neighbor up/left)
-    # We’ll process at full res, then downscale at the end if needed.
     def rgb_to_pid_block(block: np.ndarray) -> np.ndarray:
-        # block: (h, w, 3)
-        # Convert to tuples and map; vectorized via view then dict lookup per unique color
         h, w, _ = block.shape
         flat = block.reshape(-1, 3)
-        # Build pid array with default 0
-        pids = np.zeros((h * w,), dtype=np.int32)
-        # unique colors -> pids then broadcast
         uniq, idx = np.unique(flat, axis=0, return_inverse=True)
         map_arr = np.zeros((uniq.shape[0],), dtype=np.int32)
         for i, (r, g, b) in enumerate(uniq):
             map_arr[i] = color_to_pid.get((int(r), int(g), int(b)), 0)
-        pids = map_arr[idx]
-        return pids.reshape(h, w)
+        return map_arr[idx].reshape(h, w)
 
-    # Work at full size; compute colors per pixel then resize if needed
+    def color_for_pid(pid: int, is_coast: bool) -> Tuple[int, int, int]:
+        if pid in sea_ids:
+            return COAST_BLUE if is_coast else DEEP_BLUE
+        tag = owners.get(pid)
+        if not tag:
+            return UNOWNED_GRAY
+        return country_colors.get(tag, _hash_color(tag))
+
     out_full = np.zeros((H, W, 3), dtype=np.uint8)
-
-    prev_pid_row = None
-    prev_is_land_row = None
+    prev_is_land_lastrow = None
 
     for y0 in range(0, H, chunk):
         y1 = min(H, y0 + chunk)
         block = np.array(img.crop((0, y0, W, y1)), dtype=np.uint8)
         pid_block = rgb_to_pid_block(block)
+        is_sea = np.isin(pid_block, list(sea_ids))
+        is_land = ~is_sea
 
-        # Land mask for this block
-        is_sea_block = np.isin(pid_block, list(sea_ids))
-        is_land_block = ~is_sea_block
+        # neighbor land for coast: left / up
+        neighbor_land = np.zeros_like(is_sea, dtype=bool)
+        neighbor_land[:, 1:] |= is_land[:, :-1]   # left
+        neighbor_land[1:, :] |= is_land[:-1, :]   # up
+        if prev_is_land_lastrow is not None:
+            neighbor_land[0, :] |= prev_is_land_lastrow  # connect with previous chunk
 
-        # Check neighbor with previous row to detect coast sea
-        neighbor_land = np.zeros_like(is_sea_block, dtype=bool)
-        # left neighbor
-        neighbor_land[:, 1:] |= is_land_block[:, :-1]
-        # up neighbor (from prev chunk)
-        if prev_is_land_row is not None:
-            neighbor_land[0, :] |= prev_is_land_row
-        neighbor_land[1:, :] |= is_land_block[:-1, :]
-
-        # Fill colors
+        # paint
         for j in range(y1 - y0):
             for i in range(W):
                 pid = int(pid_block[j, i])
-                col = color_for_pid(pid, i, y0 + j, bool(neighbor_land[j, i]))
+                col = color_for_pid(pid, bool(neighbor_land[j, i]))
                 out_full[y0 + j, i, :] = col
 
-        prev_pid_row = pid_block[-1, :]
-        prev_is_land_row = is_land_block[-1, :]
+        prev_is_land_lastrow = is_land[-1, :]
 
-    final = out_full
     if scale != 1.0:
-        final_img = Image.fromarray(final, mode="RGB").resize((W2, H2), Image.NEAREST)
+        final_img = Image.fromarray(out_full, mode="RGB").resize((int(W * scale), int(H * scale)), Image.NEAREST)
     else:
-        final_img = Image.fromarray(final, mode="RGB")
-
+        final_img = Image.fromarray(out_full, mode="RGB")
     final_img.save(out_path)
     print(f"[OK] Map → {out_path}")
 
@@ -559,25 +509,51 @@ def main():
     if not default_map.exists():
         print("[!] default.map not found — sea detection will be limited.")
     if not colors_txt.exists():
-        print("[!] 00_country_colors.txt not found — using fallback colors.")
+        print("[!] 00_country_colors.txt not found — will rely on in-save or hash colors.")
 
     # Load assets
     color_to_pid = load_definition(definition_csv)
     sea_sets = parse_default_map(default_map) if default_map.exists() else {"sea": set(), "only_used_for_random": set()}
     sea_ids = set(sea_sets.get("sea", set())) | set(sea_sets.get("only_used_for_random", set()))
-    tag_colors = parse_country_colors(colors_txt)
+    file_colors = parse_country_colors(colors_txt)
 
-    # Read save
-    save_path = Path(args.save)
-    save_text = read_text_save(save_path)
+    # Read save + parse
+    save_text = read_text_save(Path(args.save))
     parsed = parse_save_minimal(save_text)
-
-    # Build owners map (province id -> tag or None)
-    owners: Dict[int, Optional[str]] = {}
+    countries: Dict[str, Dict[str, object]] = parsed["countries"]  # type: ignore
     provinces: Dict[int, Dict[str, object]] = parsed["provinces"]  # type: ignore
+
+    # Owners per province
+    owners: Dict[int, Optional[str]] = {}
     for pid, d in provinces.items():
         tag = d.get("owner")
         owners[pid] = str(tag) if isinstance(tag, str) and tag else None
+
+    # Compute color per tag (prefer in-save color)
+    tag_colors: Dict[str, Tuple[int, int, int]] = {}
+    for tag, c in countries.items():
+        rgb: Optional[Tuple[int, int, int]] = None
+        # map_color / color
+        for key in ("map_color", "color"):
+            v = c.get(key)
+            if isinstance(v, str) and v.startswith("{"):
+                rgb = _parse_rgb_triplet(v)
+                if rgb:
+                    break
+        # colors = { map = { r g b } } or color=...
+        if rgb is None:
+            v = c.get("colors")
+            if isinstance(v, str) and v.startswith("{"):
+                m = re.search(r"(?:map|color)\s*=\s*(\{[^}]*\})", v)
+                if m:
+                    rgb = _parse_rgb_triplet(m.group(1))
+                else:
+                    rgb = _parse_rgb_triplet(v)
+        if rgb is None:
+            rgb = file_colors.get(tag)
+        if rgb is None:
+            rgb = _hash_color(tag)
+        tag_colors[tag] = rgb
 
     # Render map
     render_map(
@@ -591,7 +567,7 @@ def main():
         scale=float(args.scale),
     )
 
-    # Write CSVs to assets (so the bot can fetch them)
+    # Ledgers → assets
     ledgers = extract_ledgers(parsed)
     write_csvs(assets, ledgers)
     print(f"[OK] CSVs → {assets}")
