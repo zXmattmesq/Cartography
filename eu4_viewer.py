@@ -387,10 +387,11 @@ def render_map(
         is_land = ~is_sea
 
         # coastal sea = sea pixels that touch land in 4-neighborhood
-        # use simple np.roll checks
         neigh = np.zeros_like(is_land)
-        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            neigh |= np.roll(is_land, shift=dy, axis=0) if dx == 0 else np.roll(is_land, shift=dx, axis=1)
+        neigh |= np.roll(is_land, shift=-1, axis=0)
+        neigh |= np.roll(is_land, shift=1, axis=0)
+        neigh |= np.roll(is_land, shift=-1, axis=1)
+        neigh |= np.roll(is_land, shift=1, axis=1)
         coastal = (~is_land) & neigh
 
         # set sea colors
@@ -434,7 +435,6 @@ def render_map(
 # -------------------------------------------------------------
 # CSV writers
 # -------------------------------------------------------------
-
 def write_csv(path: Path, rows: List[Dict[str, object]], columns: List[str]) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=columns)
@@ -446,7 +446,6 @@ def write_csv(path: Path, rows: List[Dict[str, object]], columns: List[str]) -> 
 # -------------------------------------------------------------
 # Main pipeline
 # -------------------------------------------------------------
-
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("save", help="Path to .eu4 save (text or zipped)")
