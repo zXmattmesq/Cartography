@@ -33,7 +33,7 @@ MAP_PATH = (ASSETS_DIR / "world_map.png").resolve()
 
 INTENTS = discord.Intents.default()
 client = commands.Bot(command_prefix="!", intents=INTENTS)
-tree = app_commands.CommandTree(client)
+tree = client.tree  # <-- use the existing tree; DO NOT create CommandTree(client)
 
 # -----------------------------
 # Helpers
@@ -58,11 +58,7 @@ def load_csv(name: str) -> List[Dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as f:
         return list(csv.DictReader(f))
 
-def clamp(n: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, n))
-
 def human_number(val: str) -> Tuple[float, str]:
-    """Parse numeric strings for sorting (desc). Return (float_value, original_str)."""
     if val is None:
         return (float("-inf"), "")
     s = str(val).replace(",", "").strip()
@@ -72,9 +68,7 @@ def human_number(val: str) -> Tuple[float, str]:
         return (float("-inf"), val)
 
 def format_table(rows: List[Dict[str, str]], columns: List[str], limit: int = 15) -> str:
-    """Monospace markdown table for Discord."""
     rows = rows[:limit]
-    # fixed widths
     widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in columns}
     def fmt_row(r: Dict[str, str]) -> str:
         return " | ".join(f"{str(r.get(c, '')):<{widths[c]}}" for c in columns)
@@ -94,7 +88,6 @@ class SortView(discord.ui.View):
         self.rows = rows
         self.sort_key = default_sort
 
-        # Put up to 5 sort buttons (Discord UI constraint friendliness)
         numeric_first = [c for c in columns if c != "country"]
         candidates = (["country"] + numeric_first)[:5]
         for col in candidates:
@@ -104,8 +97,7 @@ class SortView(discord.ui.View):
         if not by:
             return self.rows
         if by == "country":
-            return sorted(self.rows, key=lambda r: str(r.get("country", "")).lower(), reverse=True)  # highest->lowest lex
-        # numeric desc
+            return sorted(self.rows, key=lambda r: str(r.get("country", "")).lower(), reverse=True)
         return sorted(self.rows, key=lambda r: human_number(r.get(by, ""))[0], reverse=True)
 
 class SortButton(discord.ui.Button):
@@ -120,14 +112,12 @@ class SortButton(discord.ui.Button):
             txt = format_table(rows, self.controller.columns)
             await interaction.response.edit_message(content=txt, view=self.controller)
         except Exception:
-            # do not expose traceback
             await interaction.response.edit_message(content="Something went wrong while sorting. Try a different column.", view=self.controller)
 
 # -----------------------------
 # Core actions
 # -----------------------------
 async def run_viewer(save_path: Path) -> None:
-    """Run eu4_viewer.py and wait. Errors are handled by caller; stdout/err are not shown to users."""
     args = [
         shlex.quote(str(VIEWER)),
         shlex.quote(str(save_path)),
@@ -136,7 +126,6 @@ async def run_viewer(save_path: Path) -> None:
         "--scale", str(RENDER_SCALE),
         "--chunk", str(RENDER_CHUNK),
     ]
-    # Run quietly; collect output for logging only
     proc = await asyncio.create_subprocess_shell(
         "python " + " ".join(args),
         stdout=asyncio.subprocess.PIPE,
@@ -151,7 +140,7 @@ async def send_map(interaction: discord.Interaction):
         try:
             await interaction.followup.send(file=discord.File(str(MAP_PATH)), ephemeral=False)
         except Exception:
-            await interaction.followup.send("Map was generated, but I couldn’t attach the image. Try `/map` again.", ephemeral=True)
+            await interaction.followup.send("Map was generated, but I couldn’t attach it. Try `/map` again.", ephemeral=True)
     else:
         await interaction.followup.send("I processed the save but couldn’t find the map image. Try `/map`.", ephemeral=True)
 
@@ -168,7 +157,6 @@ async def send_table(interaction: discord.Interaction, dataset: str, default_sor
         await interaction.followup.send(msg, ephemeral=True)
         return
     view = SortView(dataset, cols, rows, default_sort=default_sort)
-    # default display sorted by first numeric column if provided
     initial_sort = default_sort or (cols[1] if len(cols) > 1 else None)
     txt = format_table(view.sorted_rows(initial_sort), cols)
     await interaction.followup.send(txt, view=view, ephemeral=False)
@@ -184,25 +172,20 @@ async def submit(interaction: discord.Interaction, attachment: discord.Attachmen
         if not attachment.filename.lower().endswith(".eu4"):
             await interaction.followup.send("Please upload a `.eu4` save file.", ephemeral=True)
             return
-        # Save temp
         tmp = ASSETS_DIR / f"save_{int(time.time())}.eu4"
         data = await attachment.read()
         tmp.write_bytes(data)
 
-        # Process save
         await run_viewer(tmp)
 
-        # Auto-post: map + overview table
         await send_map(interaction)
         await send_table(interaction, "overview", default_sort="total_development")
 
-        # Clean temp
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
 
-        # Public confirmation (no code output)
         await interaction.followup.send("Processed your save. Use `/table` for other tables or `/battles` for combat stats.", ephemeral=True)
     except Exception:
         await interaction.followup.send("I couldn’t process that save. Please make sure it’s a valid EU4 save and try again.", ephemeral=True)
@@ -247,6 +230,5 @@ async def on_ready():
         await tree.sync()
     except Exception:
         pass
-    print(f"Logged in as {client.user} (id={client.user.id})")
 
 client.run(TOKEN)
