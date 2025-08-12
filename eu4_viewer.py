@@ -3,8 +3,9 @@
 """
 EU4 Viewer — save inspector & map renderer (low-memory friendly)
 
-Usage:
-  python eu4_viewer.py "<path>/save.eu4" --assets . --out world_map.png --scale 0.75 --chunk 64
+- Renders a colored world map from assets and a .eu4 save
+- Emits CSVs with full country names
+- Adds a Battles table (battles, casualties, attrition)
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-# -------------------------- helpers & defaults -------------------------------
+# -------------------------- defaults & helpers -------------------------------
 
 TAG_NAME_FALLBACK: Dict[str, str] = {
     "FRA": "France", "ENG": "England", "GBR": "Great Britain", "CAS": "Castile",
@@ -44,7 +45,7 @@ _name_like_person = re.compile(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$")
 
 
 def read_text_save(path: Path) -> str:
-    """Read .eu4 (text or zipped). Return latin-1 text."""
+    """Read .eu4 (zip or text). Return latin-1/utf-8 text."""
     try:
         with zipfile.ZipFile(path) as z:
             name = None
@@ -75,14 +76,14 @@ def parse_numbers_block(text: str, key: str) -> List[int]:
 
 
 def load_default_map_sea_ids(default_map_text: str) -> set[int]:
+    # typical default.map contains: sea_starts = { ... }
     return set(parse_numbers_block(default_map_text, "sea_starts"))
 
 
 def load_definition_csv(path: Path) -> Dict[int, int]:
     """
     Return packed RGB -> province_id mapping.
-    Pack RGB to 24-bit key: (r<<16)|(g<<8)|b
-    EU4 definition.csv is semicolon-delimited.
+    EU4 definition.csv is semicolon-delimited: id;r;g;b;name;...
     """
     m: Dict[int, int] = {}
     with path.open("r", encoding="latin-1", errors="ignore", newline="") as f:
@@ -138,7 +139,10 @@ def looks_unitish(s: str) -> bool:
 
 
 def country_label(tag: str, c: Dict[str, object], tag_names: Dict[str, str]) -> str:
-    # Prefer custom names, then safe 'name', then tag_names.csv, fallback dict, finally tag.
+    """
+    Always return a *country* name (never a ruler/unit/tag).
+    Priority: custom names -> 'name' if safe -> tag_names.csv -> fallback dict -> TAG
+    """
     for k in ("custom_name", "country_name", "long_name"):
         v = c.get(k)
         if isinstance(v, str) and v.strip():
@@ -204,7 +208,6 @@ def parse_province_owners(save: str) -> Dict[int, str]:
       id=123 ... owner=TAG ... (within province scope)
     """
     owners: Dict[int, str] = {}
-    # Strong form: province block
     for m in re.finditer(r"province\s*=\s*\{(.*?)\}", save, flags=re.S):
         body = m.group(1)
         mid = re.search(r"\bid\s*=\s*(\d+)", body)
@@ -213,7 +216,6 @@ def parse_province_owners(save: str) -> Dict[int, str]:
             owners[int(mid.group(1))] = mo.group(1)
     if owners:
         return owners
-    # Fallback: loose id ... owner pattern
     for m in re.finditer(r"\bid\s*=\s*(\d+)(?:(?!\bid\s*=)[\s\S])*?\bower\s*=\s*([A-Z]{3})", save):
         owners[int(m.group(1))] = m.group(2)
     return owners
@@ -262,6 +264,86 @@ def prov_development(p: Dict[str, object]) -> float:
         except Exception:
             pass
     return 0.0
+
+
+# --------- battle parsing (best-effort; EU4 save formats vary by version) ----
+
+def parse_battles(save: str, tag_to_name: Dict[str, str]) -> List[Dict[str, object]]:
+    """
+    Returns list of battles with casualties/attrition. Tries multiple patterns:
+      battle = { attacker = TAG defender = TAG ... attacker_losses = 1234 defender_losses = 567 }
+      combat = { ... attacker = TAG defender = TAG ... attacker_casualties = { ... } ... }
+    If fields are missing, leaves them blank.
+    """
+    results: List[Dict[str, object]] = []
+
+    # Pattern 1: compact battle blocks
+    for m in re.finditer(r"\bbattle\s*=\s*\{([^}]*)\}", save, flags=re.S):
+        body = m.group(1)
+        attacker = _m(body, r"\battacker\s*=\s*([A-Z]{3})")
+        defender = _m(body, r"\bdefender\s*=\s*([A-Z]{3})")
+        winner = _m(body, r"\bwinner\s*=\s*([A-Z]{3})")
+        date = _m(body, r"\bdate\s*=\s*([0-9\.\-]+)")
+        province_id = _m(body, r"\bprovince\s*=\s*(\d+)")
+        a_loss = _num(body, r"\battacker_(?:losses|casualties)\s*=\s*([0-9]+)")
+        d_loss = _num(body, r"\bdefender_(?:losses|casualties)\s*=\s*([0-9]+)")
+        a_attr = _num(body, r"\battacker_attrition(?:_losses)?\s*=\s*([0-9]+)")
+        d_attr = _num(body, r"\bdefender_attrition(?:_losses)?\s*=\s*([0-9]+)")
+        if attacker or defender:
+            results.append({
+                "date": date or "",
+                "province_id": int(province_id) if province_id else "",
+                "attacker": tag_to_name.get(attacker, attacker or ""),
+                "defender": tag_to_name.get(defender, defender or ""),
+                "winner": tag_to_name.get(winner, winner or ""),
+                "attacker_casualties": a_loss or "",
+                "defender_casualties": d_loss or "",
+                "attacker_attrition": a_attr or "",
+                "defender_attrition": d_attr or "",
+                "total_casualties": (a_loss or 0) + (d_loss or 0),
+                "total_attrition": (a_attr or 0) + (d_attr or 0),
+            })
+
+    # Pattern 2: generic "combat" blocks
+    for m in re.finditer(r"\bcombat\s*=\s*\{([^}]*)\}", save, flags=re.S):
+        body = m.group(1)
+        attacker = _m(body, r"\battacker\s*=\s*([A-Z]{3})")
+        defender = _m(body, r"\bdefender\s*=\s*([A-Z]{3})")
+        winner = _m(body, r"\bwinner\s*=\s*([A-Z]{3})")
+        date = _m(body, r"\bdate\s*=\s*([0-9\.\-]+)")
+        province_id = _m(body, r"\bprovince\s*=\s*(\d+)")
+        a_loss = _num(body, r"\battacker_(?:losses|casualties)\s*=\s*([0-9]+)")
+        d_loss = _num(body, r"\bdefender_(?:losses|casualties)\s*=\s*([0-9]+)")
+        a_attr = _num(body, r"\battacker_attrition(?:_losses)?\s*=\s*([0-9]+)")
+        d_attr = _num(body, r"\bdefender_attrition(?:_losses)?\s*=\s*([0-9]+)")
+        if attacker or defender:
+            results.append({
+                "date": date or "",
+                "province_id": int(province_id) if province_id else "",
+                "attacker": tag_to_name.get(attacker, attacker or ""),
+                "defender": tag_to_name.get(defender, defender or ""),
+                "winner": tag_to_name.get(winner, winner or ""),
+                "attacker_casualties": a_loss or "",
+                "defender_casualties": d_loss or "",
+                "attacker_attrition": a_attr or "",
+                "defender_attrition": d_attr or "",
+                "total_casualties": (a_loss or 0) + (d_loss or 0),
+                "total_attrition": (a_attr or 0) + (d_attr or 0),
+            })
+    return results
+
+
+def _m(text: str, pat: str) -> Optional[str]:
+    mm = re.search(pat, text)
+    return mm.group(1) if mm else None
+
+
+def _num(text: str, pat: str) -> Optional[int]:
+    mm = re.search(pat, text)
+    try:
+        return int(mm.group(1)) if mm else None
+    except Exception:
+        return None
 
 
 # ------------------------ color utilities & rendering ------------------------
@@ -313,15 +395,216 @@ def render_map(
     tag_colors: Dict[str, Tuple[int, int, int]],
     out_path: Path,
     scale: float = 0.75,
-    chunk: int | None = None,       # NEW: process rows in bands
+    chunk: int | None = None,       # process rows in bands
 ) -> None:
     img = Image.open(provinces_bmp).convert("RGB")
     W, H = img.size
 
-    # Pre-build owner color table
     def color_for_pid(pid: int) -> Tuple[int, int, int]:
         if pid in sea_ids:
-            return (70, 90, 130)  # steel-blue sea
+            return (70, 90, 130)  # sea/ogre-blue
         tag = owners.get(pid)
         if not tag:
             return (30, 30, 30)
+        return tag_colors.get(tag, stable_color_for_tag(tag))
+
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+    band = max(1, int(chunk)) if chunk else H
+
+    y = 0
+    while y < H:
+        y1 = min(H, y + band)
+        rgb = np.array(img.crop((0, y, W, y1)), dtype=np.uint8)   # h x W x 3
+        packed = pack_rgb(rgb)                                    # h x W
+        pid = map_colors_to_pid(packed, defmap)                   # h x W
+
+        band_pids = np.unique(pid)
+        lut: Dict[int, Tuple[int, int, int]] = {int(p): color_for_pid(int(p)) for p in band_pids}
+        r = np.zeros_like(pid, dtype=np.uint8)
+        g = np.zeros_like(pid, dtype=np.uint8)
+        b = np.zeros_like(pid, dtype=np.uint8)
+        for p, (rr, gg, bb) in lut.items():
+            mask = (pid == p)
+            r[mask] = rr
+            g[mask] = gg
+            b[mask] = bb
+        out[y:y1, :, 0] = r
+        out[y:y1, :, 1] = g
+        out[y:y1, :, 2] = b
+
+        y = y1
+
+    final = Image.fromarray(out, mode="RGB")
+    if scale and scale != 1.0:
+        final = final.resize((int(W * scale), int(H * scale)), Image.NEAREST)
+    final.save(out_path)
+
+
+# ------------------------ CSV output -----------------------------------------
+
+def write_csv(path: Path, rows: List[Dict[str, object]], columns: List[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in columns})
+
+
+# ------------------------ main ------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("save", help=".eu4 save file (text or zipped)")
+    ap.add_argument("--assets", default=".", help="Folder containing provinces.bmp, definition.csv, default.map, 00_country_colors.txt")
+    ap.add_argument("--out", default="world_map.png", help="Output map path (PNG)")
+    ap.add_argument("--scale", type=float, default=0.75, help="Downscale factor for output image")
+    ap.add_argument("--chunk", type=int, default=None, help="Row band height for low-memory rendering (e.g., 64)")
+    args = ap.parse_args()
+
+    assets = Path(args.assets).resolve()
+    provinces_bmp = assets / "provinces.bmp"
+    definition_csv = assets / "definition.csv"
+    default_map = assets / "default.map"
+    country_colors = assets / "00_country_colors.txt"
+
+    # Basic existence checks
+    required = [provinces_bmp, definition_csv, default_map]
+    missing = [p.name for p in required if not p.exists()]
+    if missing:
+        # Quiet failure: caller (bot) will translate to a friendly message
+        return 2
+
+    # Load assets
+    defmap = load_definition_csv(definition_csv)
+    sea_ids = load_default_map_sea_ids(default_map.read_text(encoding="latin-1", errors="ignore"))
+    tag_colors = load_country_colors(country_colors)
+    tag_names = load_tag_names_csv(assets)
+
+    # Load & parse save
+    save_text = read_text_save(Path(args.save))
+    owners = parse_province_owners(save_text)
+    countries = parse_countries_block(save_text)
+    prov_blocks = parse_province_blocks(save_text)
+
+    # Build tag -> friendly name table once
+    tag_to_name: Dict[str, str] = {tag: country_label(tag, c.raw, tag_names) for tag, c in countries.items()}
+
+    # Per-country stats (always use friendly names)
+    dev_by_country: Dict[str, float] = {}
+    count_by_country: Dict[str, int] = {}
+    for pid, tag in owners.items():
+        name = tag_to_name.get(tag, TAG_NAME_FALLBACK.get(tag, tag))
+        count_by_country[name] = count_by_country.get(name, 0) + 1
+        dev_by_country[name] = dev_by_country.get(name, 0.0) + prov_development(prov_blocks.get(pid, {}))
+
+    rows_overview: List[Dict[str, object]] = []
+    rows_econ: List[Dict[str, object]] = []
+    rows_mil: List[Dict[str, object]] = []
+    rows_dev: List[Dict[str, object]] = []
+    rows_tech: List[Dict[str, object]] = []
+    rows_leg: List[Dict[str, object]] = []
+
+    for tag, c in countries.items():
+        cdata = c.raw
+        name = tag_to_name.get(tag, TAG_NAME_FALLBACK.get(tag, tag))
+        prov_count = count_by_country.get(name, 0)
+        total_dev = dev_by_country.get(name, 0.0)
+        avg_dev = (total_dev / prov_count) if prov_count else 0.0
+
+        # simple composite for army quality if fields exist
+        aq = 0.0
+        for k, wt in (("army_tradition", 0.5), ("army_professionalism", 0.5)):
+            v = cdata.get(k)
+            if isinstance(v, (int, float)):
+                aq += wt * float(v)
+
+        rows_overview.append({
+            "country": name,
+            "province_count": prov_count,
+            "total_development": round(total_dev, 2),
+            "avg_development": round(avg_dev, 2),
+            "income": cdata.get("income", ""),
+            "manpower": cdata.get("manpower", ""),
+            "army_quality_score": round(aq, 2) if aq else "",
+        })
+
+        rows_econ.append({
+            "country": name,
+            "income": cdata.get("income", ""),
+            "treasury": cdata.get("treasury", ""),
+            "inflation": cdata.get("inflation", ""),
+            "loans": cdata.get("loans", ""),
+            "war_exhaustion": cdata.get("war_exhaustion", ""),
+            "corruption": cdata.get("corruption", ""),
+        })
+
+        rows_mil.append({
+            "country": name,
+            "army_quality_score": round(aq, 2) if aq else "",
+            "manpower": cdata.get("manpower", ""),
+            "max_manpower": cdata.get("max_manpower", ""),
+            "land_forcelimit": cdata.get("land_forcelimit", ""),
+            "army_tradition": cdata.get("army_tradition", ""),
+            "army_professionalism": cdata.get("army_professionalism", ""),
+        })
+
+        rows_dev.append({
+            "country": name,
+            "province_count": prov_count,
+            "total_development": round(total_dev, 2),
+            "avg_development": round(avg_dev, 2),
+        })
+
+        rows_tech.append({
+            "country": name,
+            "adm_tech": cdata.get("adm_tech", ""),
+            "dip_tech": cdata.get("dip_tech", ""),
+            "mil_tech": cdata.get("mil_tech", ""),
+            "technology_group": cdata.get("technology_group", ""),
+        })
+
+        rows_leg.append({
+            "country": name,
+            "legitimacy": cdata.get("legitimacy", ""),
+            "republican_tradition": cdata.get("republican_tradition", ""),
+            "horde_unity": cdata.get("horde_unity", ""),
+            "stability": cdata.get("stability", ""),
+        })
+
+    # Battles (best-effort)
+    battles = parse_battles(save_text, tag_to_name)
+
+    # Write CSVs next to assets
+    write_csv(assets / "overview.csv", rows_overview,
+              ["country", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"])
+    write_csv(assets / "economy.csv", rows_econ,
+              ["country", "income", "treasury", "inflation", "loans", "war_exhaustion", "corruption"])
+    write_csv(assets / "military.csv", rows_mil,
+              ["country", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"])
+    write_csv(assets / "development.csv", rows_dev,
+              ["country", "province_count", "total_development", "avg_development"])
+    write_csv(assets / "technology.csv", rows_tech,
+              ["country", "adm_tech", "dip_tech", "mil_tech", "technology_group"])
+    write_csv(assets / "legitimacy.csv", rows_leg,
+              ["country", "legitimacy", "republican_tradition", "horde_unity", "stability"])
+    write_csv(assets / "battles.csv", battles,
+              ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties",
+               "attacker_attrition", "defender_attrition", "total_casualties", "total_attrition"])
+
+    # Render map
+    # Owners dict currently keyed by pid->tag; we still need tag->color mapping, so keep tags here.
+    render_map(
+        provinces_bmp=provinces_bmp,
+        defmap=defmap,
+        owners=owners,
+        sea_ids=sea_ids,
+        tag_colors=load_country_colors(country_colors),
+        out_path=Path(args.out).resolve(),
+        scale=args.scale,
+        chunk=args.chunk,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

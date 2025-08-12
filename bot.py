@@ -5,7 +5,6 @@ import io
 import os
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -14,353 +13,240 @@ from discord import app_commands
 from discord.ext import commands
 
 import subprocess
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import shlex
 
 # -----------------------------
-# Config / paths
+# Config
 # -----------------------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
-    print("Missing DISCORD_TOKEN env var")
-    raise SystemExit(1)
+    raise SystemExit("DISCORD_TOKEN is not set")
 
-# Where our static assets live (provinces.bmp, definition.csv, default.map, 00_country_colors.txt)
 ASSETS_DIR = Path(os.environ.get("ASSETS_DIR", ".")).resolve()
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default rendering knobs (safe for low memory)
-CHUNK = int(os.environ.get("RENDER_CHUNK", "64"))
-SCALE = float(os.environ.get("RENDER_SCALE", "0.75"))
+RENDER_CHUNK = int(os.environ.get("RENDER_CHUNK", "64"))
+RENDER_SCALE = float(os.environ.get("RENDER_SCALE", "0.75"))
 
-# Map output filename (we overwrite this on every submit)
-LAST_MAP = ASSETS_DIR / "world_map.png"
+VIEWER = Path(os.environ.get("VIEWER_PATH", "eu4_viewer.py")).resolve()
+MAP_PATH = (ASSETS_DIR / "world_map.png").resolve()
 
-# Small job queue to avoid multiple heavy renders at once
-JOB_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_JOBS", "1")))
-JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "420"))  # 7 minutes
-
-# -----------------------------
-# Minimal web health server (for PaaS keepalive)
-# -----------------------------
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
-        if self.path == "/healthz":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-        else:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"discord bot running")
-
-def _run_health():
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), _Health)
-    print(f"HTTP health server running on :{port}")
-    server.serve_forever()
-
-threading.Thread(target=_run_health, daemon=True).start()
+INTENTS = discord.Intents.default()
+client = commands.Bot(command_prefix="!", intents=INTENTS)
+tree = app_commands.CommandTree(client)
 
 # -----------------------------
-# Discord setup
+# Helpers
 # -----------------------------
-intents = discord.Intents.none()  # we only need interactions
-client = commands.Bot(command_prefix="!", intents=intents)
-tree = client.tree
+DATASETS = {
+    "overview": ["country", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"],
+    "economy": ["country", "income", "treasury", "inflation", "loans", "war_exhaustion", "corruption"],
+    "military": ["country", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"],
+    "development": ["country", "province_count", "total_development", "avg_development"],
+    "technology": ["country", "adm_tech", "dip_tech", "mil_tech", "technology_group"],
+    "legitimacy": ["country", "legitimacy", "republican_tradition", "horde_unity", "stability"],
+    "battles": ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties", "attacker_attrition", "defender_attrition", "total_casualties", "total_attrition"],
+}
 
-# -----------------------------
-# Utility
-# -----------------------------
-def _is_num(x: str) -> bool:
-    try:
-        float(x)
-        return True
-    except Exception:
-        return False
+def csv_path(name: str) -> Path:
+    return (ASSETS_DIR / f"{name}.csv").resolve()
 
-def _first_numeric_col(columns: List[str], rows: List[Dict[str, str]]) -> str:
-    for c in columns:
-        if any(_is_num(r.get(c, "")) for r in rows):
-            return c
-    return columns[0] if columns else "name"
-
-def _render_table(rows: List[Dict[str, str]], columns: List[str], limit: int) -> str:
-    rows = rows[:limit]
-    widths = [len(c.upper()) for c in columns]
-    for r in rows:
-        for i, c in enumerate(columns):
-            widths[i] = max(widths[i], len(str(r.get(c, ""))))
-    header = "  ".join(h.upper().ljust(widths[i]) for i, h in enumerate(columns))
-    sep = "-" * len(header)
-    lines = [header, sep]
-    for r in rows:
-        line = "  ".join(str(r.get(c, "")).ljust(widths[i]) for i, c in enumerate(columns))
-        lines.append(line)
-    return "\n".join(lines)
-
-def _read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+def load_csv(name: str) -> List[Dict[str, str]]:
+    path = csv_path(name)
+    if not path.exists():
+        return []
     with path.open("r", encoding="utf-8", newline="") as f:
-        rdr = csv.DictReader(f)
-        cols = rdr.fieldnames or []
-        rows = [r for r in rdr]
-    return cols, rows
+        return list(csv.DictReader(f))
 
-def _sort_rows(rows: List[Dict[str, str]], sort_by: str) -> List[Dict[str, str]]:
-    def keyfun(r):
-        v = r.get(sort_by, "")
-        try:
-            return float(v)
-        except Exception:
-            return -float("inf")
-    return sorted(rows, key=keyfun, reverse=True)
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+def human_number(val: str) -> Tuple[float, str]:
+    """Parse numeric strings for sorting (desc). Return (float_value, original_str)."""
+    if val is None:
+        return (float("-inf"), "")
+    s = str(val).replace(",", "").strip()
+    try:
+        return (float(s), val)
+    except:
+        return (float("-inf"), val)
+
+def format_table(rows: List[Dict[str, str]], columns: List[str], limit: int = 15) -> str:
+    """Monospace markdown table for Discord."""
+    rows = rows[:limit]
+    # fixed widths
+    widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in columns}
+    def fmt_row(r: Dict[str, str]) -> str:
+        return " | ".join(f"{str(r.get(c, '')):<{widths[c]}}" for c in columns)
+    header = " | ".join(f"{c:<{widths[c]}}" for c in columns)
+    sep = "-+-".join("-" * widths[c] for c in columns)
+    body = "\n".join(fmt_row(r) for r in rows)
+    return f"```\n{header}\n{sep}\n{body}\n```" if rows else "*(No data)*"
 
 # -----------------------------
-# Views (column sorting)
+# Sortable view
 # -----------------------------
-class TableView(discord.ui.View):
-    def __init__(
-        self,
-        category: str,
-        columns: List[str],
-        rows: List[Dict[str, str]],
-        top: int,
-        current_sort: str,
-        assets_dir: Path,
-    ):
-        super().__init__(timeout=300)
-        self.category = category
+class SortView(discord.ui.View):
+    def __init__(self, dataset: str, columns: List[str], rows: List[Dict[str, str]], default_sort: Optional[str] = None, timeout: int = 180):
+        super().__init__(timeout=timeout)
+        self.dataset = dataset
         self.columns = columns
         self.rows = rows
-        self.top = max(1, min(int(top), 200))
-        self.sort_by = current_sort
-        self.assets_dir = assets_dir
+        self.sort_key = default_sort
 
-        # Build select with display columns (hide 'tag')
-        display_cols = [c for c in self.columns if c != "tag"]
-        if "name" in display_cols:
-            display_cols.remove("name")
-            display_cols = ["name"] + display_cols
+        # Put up to 5 sort buttons (Discord UI constraint friendliness)
+        numeric_first = [c for c in columns if c != "country"]
+        candidates = (["country"] + numeric_first)[:5]
+        for col in candidates:
+            self.add_item(SortButton(col, self))
 
-        options = [
-            discord.SelectOption(label=c, value=c, default=(c == self.sort_by))
-            for c in display_cols
-        ]
-        # Discord limit: max 25 options; trim if necessary (rare)
-        options = options[:25]
+    def sorted_rows(self, by: Optional[str]) -> List[Dict[str, str]]:
+        if not by:
+            return self.rows
+        if by == "country":
+            return sorted(self.rows, key=lambda r: str(r.get("country", "")).lower(), reverse=True)  # highest->lowest lex
+        # numeric desc
+        return sorted(self.rows, key=lambda r: human_number(r.get(by, ""))[0], reverse=True)
 
-        self.select = discord.ui.Select(placeholder="Sort by column…", options=options, min_values=1, max_values=1)
-        self.select.callback = self._on_select  # type: ignore
-        self.add_item(self.select)
+class SortButton(discord.ui.Button):
+    def __init__(self, column: str, controller: SortView):
+        super().__init__(label=f"Sort: {column}", style=discord.ButtonStyle.secondary)
+        self.column = column
+        self.controller = controller
 
-    async def _on_select(self, interaction: discord.Interaction):
-        self.sort_by = self.select.values[0]
-        await self._refresh(interaction)
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            rows = self.controller.sorted_rows(self.column)
+            txt = format_table(rows, self.controller.columns)
+            await interaction.response.edit_message(content=txt, view=self.controller)
+        except Exception:
+            # do not expose traceback
+            await interaction.response.edit_message(content="Something went wrong while sorting. Try a different column.", view=self.controller)
 
-    async def _refresh(self, interaction: discord.Interaction):
-        # sort + render preview
-        rows_sorted = _sort_rows(self.rows, self.sort_by)
-        display_cols = [c for c in self.columns if c != "tag"]
-        if "name" in display_cols:
-            display_cols.remove("name")
-            display_cols = ["name"] + display_cols
+# -----------------------------
+# Core actions
+# -----------------------------
+async def run_viewer(save_path: Path) -> None:
+    """Run eu4_viewer.py and wait. Errors are handled by caller; stdout/err are not shown to users."""
+    args = [
+        shlex.quote(str(VIEWER)),
+        shlex.quote(str(save_path)),
+        "--assets", shlex.quote(str(ASSETS_DIR)),
+        "--out", shlex.quote(str(MAP_PATH)),
+        "--scale", str(RENDER_SCALE),
+        "--chunk", str(RENDER_CHUNK),
+    ]
+    # Run quietly; collect output for logging only
+    proc = await asyncio.create_subprocess_shell(
+        "python " + " ".join(args),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError("Save processing failed")
 
-        preview_rows = rows_sorted[: min(self.top, 15)]
-        preview_text = _render_table(preview_rows, display_cols, limit=len(preview_rows))
-        title = f"{self.category.capitalize()} — top {self.top} (sorted by {self.sort_by}, desc)"
-        content = f"**{title}**\n```{preview_text}```"
+async def send_map(interaction: discord.Interaction):
+    if MAP_PATH.exists():
+        try:
+            await interaction.followup.send(file=discord.File(str(MAP_PATH)), ephemeral=False)
+        except Exception:
+            await interaction.followup.send("Map was generated, but I couldn’t attach the image. Try `/map` again.", ephemeral=True)
+    else:
+        await interaction.followup.send("I processed the save but couldn’t find the map image. Try `/map`.", ephemeral=True)
 
-        # Attach full table + CSV every time (keeps message short, sortable stays snappy)
-        full_table_text = _render_table(rows_sorted, display_cols, limit=self.top)
-        buf_txt = io.BytesIO(full_table_text.encode("utf-8"))
-        buf_txt.name = "table.txt"
-
-        csv_bytes = (self.assets_dir / f"{self.category}.csv").read_bytes()
-        buf_csv = io.BytesIO(csv_bytes)
-        buf_csv.name = f"{self.category}.csv"
-
-        await interaction.response.edit_message(content=content, attachments=[discord.File(buf_txt), discord.File(buf_csv)], view=self)
+async def send_table(interaction: discord.Interaction, dataset: str, default_sort: Optional[str] = None):
+    rows = load_csv(dataset)
+    cols = DATASETS.get(dataset)
+    if not cols:
+        await interaction.followup.send("Unknown dataset.", ephemeral=True)
+        return
+    if not rows:
+        msg = "No data found for this table."
+        if dataset == "battles":
+            msg = "No battles recorded in this save."
+        await interaction.followup.send(msg, ephemeral=True)
+        return
+    view = SortView(dataset, cols, rows, default_sort=default_sort)
+    # default display sorted by first numeric column if provided
+    initial_sort = default_sort or (cols[1] if len(cols) > 1 else None)
+    txt = format_table(view.sorted_rows(initial_sort), cols)
+    await interaction.followup.send(txt, view=view, ephemeral=False)
 
 # -----------------------------
 # Slash commands
 # -----------------------------
-@tree.command(name="ping", description="Check if the bot is alive.")
-async def ping_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
+@tree.command(name="submit", description="Upload a EU4 save file")
+@app_commands.describe(attachment="Your .eu4 save (zip or text)")
+async def submit(interaction: discord.Interaction, attachment: discord.Attachment):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        if not attachment.filename.lower().endswith(".eu4"):
+            await interaction.followup.send("Please upload a `.eu4` save file.", ephemeral=True)
+            return
+        # Save temp
+        tmp = ASSETS_DIR / f"save_{int(time.time())}.eu4"
+        data = await attachment.read()
+        tmp.write_bytes(data)
 
-@tree.command(name="map", description="Show the last generated world map.")
-async def map_cmd(interaction: discord.Interaction):
-    if not LAST_MAP.exists():
-        await interaction.response.send_message("No map yet. Upload a save with `/submit` first.")
-        return
-    await interaction.response.send_message(file=discord.File(str(LAST_MAP)))
+        # Process save
+        await run_viewer(tmp)
 
-@tree.command(name="submit", description="Upload a .eu4 save and generate map + stats.")
-@app_commands.describe(
-    save="Attach a .eu4 save file (zipped saves are OK).",
-    chunk="Advanced: row chunk height (default 64)",
-    scale="Advanced: downscale factor (default 0.75)"
-)
-async def submit_save_cmd(
-    interaction: discord.Interaction,
-    save: discord.Attachment,
-    chunk: Optional[int] = None,
-    scale: Optional[float] = None,
-):
-    await interaction.response.defer(ephemeral=False, thinking=True)
+        # Auto-post: map + overview table
+        await send_map(interaction)
+        await send_table(interaction, "overview", default_sort="total_development")
 
-    if not save.filename.lower().endswith(".eu4"):
-        await interaction.followup.send("Please attach a `.eu4` save file.")
-        return
-
-    # Only one heavy render at a time
-    async with JOB_SEMAPHORE:
-        job_id = f"eu4job_{uuid.uuid4().hex[:8]}"
-        tmpdir = Path(tempfile.mkdtemp(prefix=job_id + "_", dir="/tmp"))
+        # Clean temp
         try:
-            # download to tmp
-            save_path = tmpdir / save.filename
-            data = await save.read()
-            save_path.write_bytes(data)
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-            # run eu4_viewer
-            cmd = [
-                "python", str(Path(__file__).with_name("eu4_viewer.py")),
-                str(save_path),
-                "--assets", str(ASSETS_DIR),
-                "--out", str(LAST_MAP),
-                "--chunk", str(chunk or CHUNK),
-                "--scale", str(scale or SCALE),
-            ]
-            start = time.time()
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        # Public confirmation (no code output)
+        await interaction.followup.send("Processed your save. Use `/table` for other tables or `/battles` for combat stats.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("I couldn’t process that save. Please make sure it’s a valid EU4 save and try again.", ephemeral=True)
 
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=JOB_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await interaction.followup.send("⏱️ Processing timed out. Try a smaller map (lower `--scale`) or a shorter save.")
-                return
+@tree.command(name="map", description="Show the latest rendered world map")
+async def map_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    await send_map(interaction)
 
-            # log (for troubleshooting)
-            if stdout:
-                print(stdout.decode("utf-8", errors="ignore"))
-            if stderr:
-                print(stderr.decode("utf-8", errors="ignore"))
-
-            if proc.returncode != 0:
-                await interaction.followup.send("❌ Failed to process the save. Check your assets files and try again.")
-                return
-
-            # Success: post a simple message + the map
-            if LAST_MAP.exists():
-                await interaction.followup.send(
-                    "Processed your save. **Map below.** Use **/table** to view stats.",
-                    file=discord.File(str(LAST_MAP)),
-                )
-            else:
-                await interaction.followup.send("Processed your save. Use **/map** to view the world map and **/table** to view stats.")
-
-            dur = time.time() - start
-            print(f"Completed job in {dur:.1f}s → {LAST_MAP}")
-
-        finally:
-            # best effort cleanup
-            try:
-                for p in tmpdir.glob("*"):
-                    p.unlink(missing_ok=True)
-                tmpdir.rmdir()
-            except Exception:
-                pass
-
-# Table categories available (must match CSV filenames written by eu4_viewer.py)
-TABLE_CHOICES = [
+@tree.command(name="table", description="Show a sortable table")
+@app_commands.describe(name="Which table to show")
+@app_commands.choices(name=[
     app_commands.Choice(name="Overview", value="overview"),
     app_commands.Choice(name="Economy", value="economy"),
     app_commands.Choice(name="Military", value="military"),
     app_commands.Choice(name="Development", value="development"),
     app_commands.Choice(name="Technology", value="technology"),
     app_commands.Choice(name="Legitimacy", value="legitimacy"),
-]
-
-@tree.command(name="table", description="Show a stats table (sortable).")
-@app_commands.describe(
-    category="Which table to show",
-    top="How many rows (default 10, up to 200)",
-    sort_by="Sort column (optional; you can change later with the dropdown)"
-)
-@app_commands.choices(category=TABLE_CHOICES)
-async def table_cmd(
-    interaction: discord.Interaction,
-    category: app_commands.Choice[str],
-    top: Optional[int] = 10,
-    sort_by: Optional[str] = None,
-):
-    await interaction.response.defer(ephemeral=False, thinking=True)
-
-    csv_path = ASSETS_DIR / f"{category.value}.csv"
-    if not csv_path.exists():
-        await interaction.followup.send(f"Couldn't find `{category.value}.csv`. Upload a save first with `/submit`.")
-        return
-
-    columns, rows = _read_csv(csv_path)
-    if not rows:
-        await interaction.followup.send("No data yet. Did the save parse correctly?")
-        return
-
-    top = max(1, min(int(top or 10), 200))
-
-    # Choose default sort
-    if sort_by is None or sort_by not in columns:
-        sort_by = _first_numeric_col(columns, rows)
-
-    rows_sorted = _sort_rows(rows, sort_by)
-
-    # Choose display columns (hide 'tag', put 'name' first if present)
-    display_cols = [c for c in columns if c != "tag"]
-    if "name" in display_cols:
-        display_cols.remove("name")
-        display_cols = ["name"] + display_cols
-
-    # Build preview
-    preview_rows = rows_sorted[: min(top, 15)]
-    preview = _render_table(preview_rows, display_cols, limit=len(preview_rows))
-    title = f"{category.value.capitalize()} — top {top} (sorted by {sort_by}, desc)"
-    content = f"**{title}**\n```{preview}```"
-
-    # Attach full table and the raw CSV
-    full_table_text = _render_table(rows_sorted, display_cols, limit=top)
-    buf_txt = io.BytesIO(full_table_text.encode("utf-8"))
-    buf_txt.name = "table.txt"
-
-    csv_bytes = csv_path.read_bytes()
-    buf_csv = io.BytesIO(csv_bytes)
-    buf_csv.name = f"{category.value}.csv"
-
-    view = TableView(
-        category=category.value,
-        columns=columns,
-        rows=rows,
-        top=top,
-        current_sort=sort_by,
-        assets_dir=ASSETS_DIR,
-    )
-    await interaction.followup.send(content=content, files=[discord.File(buf_txt), discord.File(buf_csv)], view=view)
+    app_commands.Choice(name="Battles", value="battles"),
+])
+async def table_cmd(interaction: discord.Interaction, name: app_commands.Choice[str]):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    default = None
+    if name.value in ("overview", "development"):
+        default = "total_development"
+    elif name.value == "economy":
+        default = "income"
+    elif name.value == "military":
+        default = "army_quality_score"
+    elif name.value == "technology":
+        default = "mil_tech"
+    elif name.value == "battles":
+        default = "total_casualties"
+    await send_table(interaction, name.value, default_sort=default)
 
 # -----------------------------
-# Startup / sync
+# Startup
 # -----------------------------
 @client.event
 async def on_ready():
     try:
         await tree.sync()
-        print("Slash commands synced.")
-    except Exception as e:
-        print("Failed to sync commands:", e)
+    except Exception:
+        pass
     print(f"Logged in as {client.user} (id={client.user.id})")
 
 client.run(TOKEN)
