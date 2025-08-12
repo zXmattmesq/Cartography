@@ -3,8 +3,8 @@
 """
 EU4 Viewer — save inspector & map renderer (low-memory friendly)
 
-Usage example:
-    python eu4_viewer.py "<path>/save.eu4" --assets . --out world_map.png --scale 0.75
+Usage:
+  python eu4_viewer.py "<path>/save.eu4" --assets . --out world_map.png --scale 0.75 --chunk 64
 """
 
 from __future__ import annotations
@@ -82,12 +82,13 @@ def load_definition_csv(path: Path) -> Dict[int, int]:
     """
     Return packed RGB -> province_id mapping.
     Pack RGB to 24-bit key: (r<<16)|(g<<8)|b
+    EU4 definition.csv is semicolon-delimited.
     """
     m: Dict[int, int] = {}
-    with path.open("r", encoding="latin-1", errors="ignore") as f:
-        reader = csv.reader(f)
+    with path.open("r", encoding="latin-1", errors="ignore", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
         for row in reader:
-            if not row or row[0].startswith("#"):
+            if not row or not row[0] or row[0].startswith("#"):
                 continue
             try:
                 pid = int(row[0])
@@ -114,6 +115,7 @@ def load_country_colors(path: Path) -> Dict[str, Tuple[int, int, int]]:
 
 
 def load_tag_names_csv(assets_dir: Path) -> Dict[str, str]:
+    """Optional friendly-name overrides: assets/tag_names.csv (TAG,Name)."""
     p = assets_dir / "tag_names.csv"
     if not p.exists():
         return {}
@@ -311,224 +313,15 @@ def render_map(
     tag_colors: Dict[str, Tuple[int, int, int]],
     out_path: Path,
     scale: float = 0.75,
+    chunk: int | None = None,       # NEW: process rows in bands
 ) -> None:
     img = Image.open(provinces_bmp).convert("RGB")
     W, H = img.size
-    rgb = np.array(img, dtype=np.uint8)           # HxWx3
-    packed = pack_rgb(rgb)                        # HxW uint32
-    pid = map_colors_to_pid(packed, defmap)       # HxW int32
 
-    if np.all(pid == 0):
-        # Definition.csv doesn’t match provinces.bmp (wrong version or mod).
-        # Don’t leave a blue rectangle—emit a diagnostic image.
-        diag = Image.new("RGB", (W, H), (200, 50, 50))
-        diag.save(out_path)
-        print("[!] All province IDs resolved to 0. Check that provinces.bmp and definition.csv match.")
-        return
-
-    is_sea = np.isin(pid, list(sea_ids)) | (pid == 0)
-    is_land = ~is_sea
-
-    # Coastal sea (4-neighborhood touches land)
-    coastal = np.zeros_like(is_sea)
-    coastal |= np.roll(is_land, 1, axis=0)
-    coastal |= np.roll(is_land, -1, axis=0)
-    coastal |= np.roll(is_land, 1, axis=1)
-    coastal |= np.roll(is_land, -1, axis=1)
-    coastal &= ~is_land
-
-    out = np.zeros((H, W, 3), dtype=np.uint8)
-    DEEP = np.array([24, 80, 160], dtype=np.uint8)
-    COAST = np.array([60, 140, 200], dtype=np.uint8)
-    UNOCC = np.array([170, 170, 170], dtype=np.uint8)
-
-    out[is_sea] = DEEP
-    out[coastal] = COAST
-
-    # Color land by owner tag
-    land_pid = pid[is_land]
-    unique_pids = np.unique(land_pid)
-    # Build pid -> color
-    pid_color: Dict[int, Tuple[int, int, int]] = {}
-    for p in unique_pids:
-        tag = owners.get(int(p))
+    # Pre-build owner color table
+    def color_for_pid(pid: int) -> Tuple[int, int, int]:
+        if pid in sea_ids:
+            return (70, 90, 130)  # steel-blue sea
+        tag = owners.get(pid)
         if not tag:
-            pid_color[int(p)] = tuple(UNOCC.tolist())
-            continue
-        c = tag_colors.get(tag)
-        if c is None:
-            c = stable_color_for_tag(tag)
-            tag_colors[tag] = c
-        pid_color[int(p)] = c
-
-    # Apply colors
-    for p in unique_pids:
-        mask = (pid == p)
-        c = pid_color[int(p)]
-        out[mask] = c
-
-    final = Image.fromarray(out, mode="RGB")
-    if scale and scale != 1.0:
-        final = final.resize((int(W * scale), int(H * scale)), Image.NEAREST)
-    final.save(out_path)
-    print(f"[OK] Map → {out_path}")
-
-
-# ------------------------ CSV output -----------------------------------------
-
-def write_csv(path: Path, rows: List[Dict[str, object]], columns: List[str]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=columns)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in columns})
-
-
-# ------------------------ main pipeline --------------------------------------
-
-def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("save", help="Path to .eu4 save (text or zipped)")
-    ap.add_argument("--assets", default=".", help="Assets directory")
-    ap.add_argument("--out", default="world_map.png", help="Output map PNG")
-    ap.add_argument("--scale", type=float, default=0.75, help="Final image scale")
-    args = ap.parse_args(argv)
-
-    assets = Path(args.assets).resolve()
-    provinces_bmp = assets / "provinces.bmp"
-    definition_csv = assets / "definition.csv"
-    default_map = assets / "default.map"
-    colors_txt = assets / "00_country_colors.txt"
-
-    if not provinces_bmp.exists() or not definition_csv.exists() or not default_map.exists():
-        print("[!] Missing required assets (provinces.bmp, definition.csv, default.map)")
-        return 2
-
-    # Load assets
-    defmap = load_definition_csv(definition_csv)
-    sea_ids = load_default_map_sea_ids(default_map.read_text(encoding="latin-1", errors="ignore"))
-    tag_colors = load_country_colors(colors_txt)
-    tag_names = load_tag_names_csv(assets)
-
-    # Read & parse save
-    save_text = read_text_save(Path(args.save))
-    countries = parse_countries_block(save_text)
-    owners = parse_province_owners(save_text)
-    provs = parse_province_blocks(save_text)
-
-    # Aggregate per-country province counts & development
-    prov_count: Dict[str, int] = {}
-    prov_dev: Dict[str, float] = {}
-    for pid, tag in owners.items():
-        prov_count[tag] = prov_count.get(tag, 0) + 1
-        d = provs.get(pid)
-        if d:
-            prov_dev[tag] = prov_dev.get(tag, 0.0) + prov_development(d)
-
-    # Build CSV rows
-    rows_overview: List[Dict[str, object]] = []
-    rows_econ: List[Dict[str, object]] = []
-    rows_mil: List[Dict[str, object]] = []
-    rows_dev: List[Dict[str, object]] = []
-    rows_tech: List[Dict[str, object]] = []
-    rows_leg: List[Dict[str, object]] = []
-
-    tags = set(list(countries.keys()) + list(prov_count.keys()))
-    for tag in sorted(tags):
-        c = countries.get(tag).raw if tag in countries else {}
-        # human-readable country name
-        name = country_label(tag, c, tag_names)
-
-        pcount = prov_count.get(tag, 0)
-        dtotal = round(prov_dev.get(tag, 0.0), 2)
-        davg = round(dtotal / pcount, 2) if pcount else 0.0
-
-        aq = ""
-        at, ap = c.get("army_tradition"), c.get("army_professionalism")
-        if isinstance(at, (int, float)) or isinstance(ap, (int, float)):
-            aq = round(float(at or 0) * 0.6 + float(ap or 0) * 0.4, 3)
-
-        rows_overview.append({
-            "tag": tag, "country": name, "name": name,
-            "province_count": pcount,
-            "total_development": dtotal,
-            "avg_development": davg,
-            "income": c.get("income", ""),
-            "manpower": c.get("manpower", ""),
-            "army_quality_score": aq,
-        })
-
-        rows_econ.append({
-            "tag": tag, "country": name, "name": name,
-            "income": c.get("income", ""),
-            "treasury": c.get("treasury", ""),
-            "inflation": c.get("inflation", ""),
-            "loans": c.get("loans", ""),
-            "interest": "",
-            "war_exhaustion": c.get("war_exhaustion", ""),
-            "corruption": c.get("corruption", ""),
-        })
-
-        rows_mil.append({
-            "tag": tag, "country": name, "name": name,
-            "army_quality_score": aq,
-            "manpower": c.get("manpower", ""),
-            "max_manpower": c.get("max_manpower", ""),
-            "land_forcelimit": c.get("land_forcelimit", ""),
-            "army_tradition": c.get("army_tradition", ""),
-            "army_professionalism": c.get("army_professionalism", ""),
-        })
-
-        rows_dev.append({
-            "tag": tag, "country": name, "name": name,
-            "province_count": pcount,
-            "total_development": dtotal,
-            "avg_development": davg,
-        })
-
-        rows_tech.append({
-            "tag": tag, "country": name, "name": name,
-            "adm_tech": c.get("adm_tech", ""),
-            "dip_tech": c.get("dip_tech", ""),
-            "mil_tech": c.get("mil_tech", ""),
-            "technology_group": c.get("technology_group", ""),
-        })
-
-        rows_leg.append({
-            "tag": tag, "country": name, "name": name,
-            "legitimacy": c.get("legitimacy", ""),
-            "republican_tradition": c.get("republican_tradition", ""),
-            "horde_unity": c.get("horde_unity", ""),
-            "stability": c.get("stability", ""),
-        })
-
-    # Write CSVs next to assets (bot reads from there)
-    write_csv(assets / "overview.csv", rows_overview,
-              ["tag", "country", "name", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"])
-    write_csv(assets / "economy.csv", rows_econ,
-              ["tag", "country", "name", "income", "treasury", "inflation", "loans", "interest", "war_exhaustion", "corruption"])
-    write_csv(assets / "military.csv", rows_mil,
-              ["tag", "country", "name", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"])
-    write_csv(assets / "development.csv", rows_dev,
-              ["tag", "country", "name", "province_count", "total_development", "avg_development"])
-    write_csv(assets / "technology.csv", rows_tech,
-              ["tag", "country", "name", "adm_tech", "dip_tech", "mil_tech", "technology_group"])
-    write_csv(assets / "legitimacy.csv", rows_leg,
-              ["tag", "country", "name", "legitimacy", "republican_tradition", "horde_unity", "stability"])
-    print(f"[OK] CSVs → {assets}")
-
-    # Render map
-    render_map(
-        provinces_bmp=provinces_bmp,
-        defmap=defmap,
-        owners=owners,
-        sea_ids=sea_ids,
-        tag_colors=tag_colors,
-        out_path=Path(args.out).resolve(),
-        scale=args.scale,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+            return (30, 30, 30)
