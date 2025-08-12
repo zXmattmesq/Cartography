@@ -156,6 +156,23 @@ def get_country_label(tag: str, country_data: Dict[str, object], tag_names: Dict
 
 # -------------------------- parsing save -------------------------------------
 
+def _find_block(text: str, key: str) -> Optional[str]:
+    """Finds and returns the content of a {...} block using brace counting."""
+    match = re.search(rf"\n{key}\s*=\s*\{{", text)
+    if not match:
+        return None
+    
+    start_index = match.end()
+    brace_level = 1
+    for i in range(start_index, len(text)):
+        if text[i] == '{':
+            brace_level += 1
+        elif text[i] == '}':
+            brace_level -= 1
+            if brace_level == 0:
+                return text[start_index:i]
+    return None # Unclosed block
+
 @dataclass
 class Country:
     tag: str
@@ -164,33 +181,14 @@ class Country:
 def parse_countries_block(save_text: str) -> Dict[str, Country]:
     """Parses the 'countries' block from the save file."""
     out: Dict[str, Country] = {}
-    countries_match = re.search(r"\ncountries\s*=\s*\{", save_text)
-    if not countries_match:
+    countries_block = _find_block(save_text, "countries")
+    if not countries_block:
         return out
 
-    # Find the corresponding closing brace for the countries block
-    start_index = countries_match.end()
-    brace_level = 1
-    end_index = -1
-    for i in range(start_index, len(save_text)):
-        if save_text[i] == '{':
-            brace_level += 1
-        elif save_text[i] == '}':
-            brace_level -= 1
-            if brace_level == 0:
-                end_index = i
-                break
-    
-    if end_index == -1:
-        return out # Malformed file
-
-    countries_block = save_text[start_index:end_index]
-
-    for m in re.finditer(r"\n\s*([A-Z]{3})\s*=\s*\{(.*?)\n\s*\}", countries_block, flags=re.S):
+    for m in re.finditer(r"([A-Z]{3})\s*=\s*\{(.*?)\}", countries_block, flags=re.S):
         tag, body = m.group(1), m.group(2)
         data: Dict[str, object] = {}
         
-        # Regex to find key = value or key = "value" pairs
         for item_match in re.finditer(r"\b(\w+)\s*=\s*(\S+)", body):
             key, val_str = item_match.group(1), item_match.group(2)
             if '"' in val_str:
@@ -201,7 +199,6 @@ def parse_countries_block(save_text: str) -> Dict[str, Country]:
                 except ValueError:
                     data[key] = val_str
 
-        # Special handling for blocks like 'loans'
         loans_match = re.search(r"\bloans\s*=\s*\{([^}]*)\}", body, flags=re.S)
         if loans_match:
             data["loans"] = len(re.findall(r"\bloan\s*=\s*\{", loans_match.group(1)))
@@ -210,52 +207,40 @@ def parse_countries_block(save_text: str) -> Dict[str, Country]:
     return out
 
 
-def parse_province_owners(save: str) -> Dict[int, str]:
-    """More robustly finds province owners, handling nested structures."""
+def parse_province_owners(save_text: str) -> Dict[int, str]:
+    """Parses the 'provinces' block to find the owner of each province."""
     owners: Dict[int, str] = {}
-    # Iterate through top-level province definitions: -[number]={ ... }
-    for m in re.finditer(r"-\d+\s*=\s*\{", save):
-        start = m.end()
-        brace_level = 1
-        for i in range(start, len(save)):
-            if save[i] == '{':
-                brace_level += 1
-            elif save[i] == '}':
-                brace_level -= 1
-                if brace_level == 0:
-                    body = save[start:i]
-                    owner_match = re.search(r"\bower\s*=\s*\"?([A-Z]{3})\"?", body)
-                    if owner_match:
-                        # The province ID is the number in "-[number]="
-                        pid = int(m.group(0).split('=')[0].strip().replace('-', ''))
-                        owners[pid] = owner_match.group(1)
-                    break
+    provinces_block = _find_block(save_text, "provinces")
+    if not provinces_block:
+        print("Warning: 'provinces' block not found in save file.", file=sys.stderr)
+        return {}
+
+    # Iterate over province entries. Format is -ID={...owner="TAG"...}
+    for m in re.finditer(r"(-(\d+))\s*=\s*\{(.*?)\}", provinces_block, re.S):
+        province_id_str, province_body = m.group(2), m.group(3)
+        owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', province_body)
+        if owner_match:
+            try:
+                pid = int(province_id_str)
+                tag = owner_match.group(1)
+                owners[pid] = tag
+            except ValueError:
+                continue
     return owners
 
 
-def parse_province_blocks(save: str) -> Dict[int, Dict[str, object]]:
+def parse_province_blocks(save_text: str) -> Dict[int, Dict[str, object]]:
     """Parses development and other data from province blocks."""
     out: Dict[int, Dict[str, object]] = {}
-    # Regex to find province blocks, which are typically identified by a negative number key
-    for m in re.finditer(r"(-\d+)\s*=\s*\{", save):
-        pid = int(m.group(1).strip('-'))
-        start = m.end()
-        brace_level = 1
-        body = ""
-        for i in range(start, len(save)):
-            if save[i] == '{':
-                brace_level += 1
-            elif save[i] == '}':
-                brace_level -= 1
-                if brace_level == 0:
-                    body = save[start:i]
-                    break
-        
-        if not body:
-            continue
+    provinces_block = _find_block(save_text, "provinces")
+    if not provinces_block:
+        return {}
 
+    for m in re.finditer(r"(-(\d+))\s*=\s*\{(.*?)\}", provinces_block, re.S):
+        pid = int(m.group(2))
+        body = m.group(3)
+        
         d: Dict[str, object] = {}
-        # Find all simple key=value pairs
         for item_match in re.finditer(r"\b(\w+)\s*=\s*([\d\.]+)", body):
             key, val_str = item_match.group(1), item_match.group(2)
             try:
@@ -263,7 +248,6 @@ def parse_province_blocks(save: str) -> Dict[int, Dict[str, object]]:
             except ValueError:
                 pass
         
-        # Handle history block separately for base values
         hist_match = re.search(r"\bhistory\s*=\s*\{([^}]*)\}", body, flags=re.S)
         if hist_match:
             hist_body = hist_match.group(1)
@@ -281,13 +265,11 @@ def parse_province_blocks(save: str) -> Dict[int, Dict[str, object]]:
 
 def get_province_development(p_data: Dict[str, object]) -> float:
     """Calculates total development from province data."""
-    # First, try explicit total development fields
     for key in ("development", "total_development", "dev", "curr_development"):
         val = p_data.get(key)
         if isinstance(val, (int, float)):
             return float(val)
             
-    # Fallback to summing base values
     tax = p_data.get("base_tax", 0.0)
     prod = p_data.get("base_production", 0.0)
     manp = p_data.get("base_manpower", 0.0)
@@ -300,13 +282,9 @@ def get_province_development(p_data: Dict[str, object]) -> float:
 # --------- battle parsing (best-effort; EU4 save formats vary by version) ----
 
 def parse_battles(save: str, tag_to_name: Dict[str, str]) -> List[Dict[str, object]]:
-    """
-    Returns list of battles with casualties/attrition.
-    Searches for 'battle={...}' or 'combat={...}' blocks.
-    """
+    """Returns list of battles with casualties/attrition."""
     results: List[Dict[str, object]] = []
     
-    # This single regex finds either 'battle' or 'combat' blocks
     for m in re.finditer(r"\b(?:battle|combat)\s*=\s*\{([^}]*)\}", save, flags=re.S):
         body = m.group(1)
         
@@ -361,7 +339,6 @@ def stable_color_for_tag(tag: str) -> Tuple[int, int, int]:
     r = (h >> 16) & 0xFF
     g = (h >> 8) & 0xFF
     b = h & 0xFF
-    # Boost saturation and value to avoid muddy colors
     return (min(255, r + 50), min(255, g + 50), min(255, b + 50))
 
 
@@ -373,7 +350,6 @@ def pack_rgb(arr: np.ndarray) -> np.ndarray:
 
 def map_colors_to_pid(packed_rgb: np.ndarray, color_to_pid: Dict[int, int]) -> np.ndarray:
     """Vectorized mapping of packed colors -> province ids (0 when missing)."""
-    # Prepare sorted lookup arrays for efficient searching
     unique_colors = np.array(list(color_to_pid.keys()), dtype=np.uint32)
     pids_for_colors = np.array([color_to_pid[c] for c in unique_colors], dtype=np.int32)
     
@@ -381,14 +357,11 @@ def map_colors_to_pid(packed_rgb: np.ndarray, color_to_pid: Dict[int, int]) -> n
     sorted_colors = unique_colors[sort_indices]
     sorted_pids = pids_for_colors[sort_indices]
 
-    # Find where the image's colors would be inserted in the sorted list
     flat_packed = packed_rgb.flatten()
     indices = np.searchsorted(sorted_colors, flat_packed)
     
-    # Create an output array initialized to 0 (for unmapped pixels)
     out = np.zeros_like(flat_packed, dtype=np.int32)
     
-    # Find valid matches and map them
     valid_mask = (indices < len(sorted_colors)) & (sorted_colors[indices] == flat_packed)
     out[valid_mask] = sorted_pids[indices[valid_mask]]
     
@@ -397,51 +370,42 @@ def map_colors_to_pid(packed_rgb: np.ndarray, color_to_pid: Dict[int, int]) -> n
 
 def render_map(
     provinces_bmp: Path,
-    defmap: Dict[int, int],         # packedRGB -> pid
-    pid_to_color: Dict[int, Tuple[int, int, int]], # pid -> (r,g,b)
+    defmap: Dict[int, int],
+    pid_to_color: Dict[int, Tuple[int, int, int]],
     out_path: Path,
     scale: float = 0.75,
-    chunk_height: int | None = None, # process rows in bands
+    chunk_height: int | None = None,
 ) -> None:
     """Renders the final political map."""
     img = Image.open(provinces_bmp).convert("RGB")
     W, H = img.size
 
-    # Create the final output image canvas
     out_img_arr = np.zeros((H, W, 3), dtype=np.uint8)
-    
-    # Determine processing band height
     band_height = chunk_height if chunk_height and chunk_height > 0 else H
 
     for y_start in range(0, H, band_height):
         y_end = min(H, y_start + band_height)
         
-        # Crop a horizontal band from the source image
         band_img = img.crop((0, y_start, W, y_end))
         rgb_band = np.array(band_img, dtype=np.uint8)
         
-        # Convert this band to province IDs
         packed_band = pack_rgb(rgb_band)
         pid_band = map_colors_to_pid(packed_band, defmap)
         
-        # Create RGB channels for the output band
         r_ch = np.zeros_like(pid_band, dtype=np.uint8)
         g_ch = np.zeros_like(pid_band, dtype=np.uint8)
         b_ch = np.zeros_like(pid_band, dtype=np.uint8)
         
-        # Use the pre-calculated pid_to_color map to fill channels
         for pid, (r, g, b) in pid_to_color.items():
             mask = (pid_band == pid)
             r_ch[mask] = r
             g_ch[mask] = g
             b_ch[mask] = b
             
-        # Place the colored channels into the final output array
         out_img_arr[y_start:y_end, :, 0] = r_ch
         out_img_arr[y_start:y_end, :, 1] = g_ch
         out_img_arr[y_start:y_end, :, 2] = b_ch
 
-    # Create image from the final array
     final_img = Image.fromarray(out_img_arr, mode="RGB")
     if scale and scale != 1.0:
         final_img = final_img.resize((int(W * scale), int(H * scale)), Image.NEAREST)
@@ -476,28 +440,23 @@ def main() -> int:
     default_map = assets / "default.map"
     country_colors_txt = assets / "00_country_colors.txt"
 
-    # Check for essential asset files
     for p in [provinces_bmp, definition_csv, default_map]:
         if not p.exists():
             print(f"Error: Missing essential asset file: {p.name}", file=sys.stderr)
             return 2
 
-    # Load assets
     defmap = load_definition_csv(definition_csv)
     sea_ids = load_default_map_sea_ids(default_map.read_text(encoding="latin-1", errors="ignore"))
     tag_colors = load_country_colors(country_colors_txt)
     tag_names = load_tag_names_csv(assets)
 
-    # Load & parse save file
     save_text = read_text_save(Path(args.save))
     owners = parse_province_owners(save_text)
     countries = parse_countries_block(save_text)
     prov_blocks = parse_province_blocks(save_text)
 
-    # Build tag -> friendly name table once
     tag_to_name: Dict[str, str] = {tag: get_country_label(tag, c.raw, tag_names) for tag, c in countries.items()}
 
-    # Aggregate per-country stats
     dev_by_country: Dict[str, float] = {}
     count_by_country: Dict[str, int] = {}
     for pid, tag in owners.items():
@@ -505,7 +464,6 @@ def main() -> int:
         count_by_country[name] = count_by_country.get(name, 0) + 1
         dev_by_country[name] = dev_by_country.get(name, 0.0) + get_province_development(prov_blocks.get(pid, {}))
 
-    # Prepare data rows for CSV output
     all_rows = []
     for tag, c in countries.items():
         cdata = c.raw
@@ -513,7 +471,6 @@ def main() -> int:
         prov_count = count_by_country.get(name, 0)
         total_dev = dev_by_country.get(name, 0.0)
         
-        # Calculate army quality score
         aq = 0.0
         tradition = cdata.get("army_tradition", 0.0)
         prof = cdata.get("army_professionalism", 0.0)
@@ -547,10 +504,8 @@ def main() -> int:
             "stability": cdata.get("stability", ""),
         })
 
-    # Battles
     battles = parse_battles(save_text, tag_to_name)
 
-    # Write all CSVs
     write_csv(assets / "overview.csv", all_rows,
               ["country", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"])
     write_csv(assets / "economy.csv", all_rows,
@@ -567,12 +522,9 @@ def main() -> int:
               ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties",
                "attacker_attrition", "defender_attrition", "total_casualties", "total_attrition"])
 
-    # --- Efficient Map Rendering ---
-    # 1. Create a single, comprehensive lookup table from Province ID -> Final Color
     pid_to_final_color: Dict[int, Tuple[int, int, int]] = {}
     all_pids = set(defmap.values())
     
-    # Default color for unowned land
     unowned_land_color = (50, 50, 50)
     sea_color = (70, 90, 130)
 
@@ -583,12 +535,10 @@ def main() -> int:
         
         owner_tag = owners.get(pid)
         if owner_tag:
-            # Use defined country color, or generate a stable one
             pid_to_final_color[pid] = tag_colors.get(owner_tag, stable_color_for_tag(owner_tag))
         else:
             pid_to_final_color[pid] = unowned_land_color
 
-    # 2. Render the map using this efficient lookup
     render_map(
         provinces_bmp=provinces_bmp,
         defmap=defmap,
