@@ -1,5 +1,4 @@
 discord.py
 pillow
-pandas
-xlsxwriter
+numpy
 python-dotenv

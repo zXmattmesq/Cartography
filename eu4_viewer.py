@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
 import os
 import re
 import sys
@@ -45,38 +44,33 @@ _name_like_person = re.compile(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$")
 
 
 def read_text_save(path: Path) -> str:
-    """Read .eu4 (zip or text). Return latin-1/utf-8 text."""
+    """Read .eu4 (zip or text). Return text, trying latin-1 then utf-8."""
+    data = b""
     try:
         with zipfile.ZipFile(path) as z:
-            name = None
-            for n in z.namelist():
-                if n.endswith("gamestate"):
-                    name = n
-                    break
-            if name is None:
-                name = z.namelist()[0]
+            # Find the main gamestate file within the zip
+            gamestate_files = [n for n in z.namelist() if n.endswith("gamestate") or n == "gamestate"]
+            name = gamestate_files[0] if gamestate_files else z.namelist()[0]
             data = z.read(name)
-            try:
-                return data.decode("latin-1")
-            except Exception:
-                return data.decode("utf-8", errors="ignore")
     except zipfile.BadZipFile:
-        raw = path.read_bytes()
-        try:
-            return raw.decode("latin-1")
-        except Exception:
-            return raw.decode("utf-8", errors="ignore")
+        data = path.read_bytes()
+    
+    try:
+        return data.decode("latin-1")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="ignore")
 
 
 def parse_numbers_block(text: str, key: str) -> List[int]:
-    m = re.search(rf"{re.escape(key)}\s*=\s*\{{([^}}]*)\}}", text)
+    """Extracts a list of integers from a block like `key={ ... }`."""
+    m = re.search(rf"\b{re.escape(key)}\s*=\s*\{{([^}}]*)\}}", text, flags=re.IGNORECASE)
     if not m:
         return []
-    return [int(x) for x in re.findall(r"-?\d+", m.group(1))]
+    return [int(x) for x in re.findall(r"\d+", m.group(1))]
 
 
 def load_default_map_sea_ids(default_map_text: str) -> set[int]:
-    # typical default.map contains: sea_starts = { ... }
+    """Loads sea province IDs from default.map text."""
     return set(parse_numbers_block(default_map_text, "sea_starts"))
 
 
@@ -85,20 +79,21 @@ def load_definition_csv(path: Path) -> Dict[int, int]:
     Return packed RGB -> province_id mapping.
     EU4 definition.csv is semicolon-delimited: id;r;g;b;name;...
     """
-    m: Dict[int, int] = {}
+    mapping: Dict[int, int] = {}
+    if not path.exists():
+        return mapping
     with path.open("r", encoding="latin-1", errors="ignore", newline="") as f:
         reader = csv.reader(f, delimiter=";")
         for row in reader:
-            if not row or not row[0] or row[0].startswith("#"):
+            if not row or not row[0] or not row[0].isdigit():
                 continue
             try:
-                pid = int(row[0])
-                r, g, b = int(row[1]), int(row[2]), int(row[3])
-            except Exception:
+                pid, r, g, b = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+                key = (r << 16) | (g << 8) | b
+                mapping[key] = pid
+            except (ValueError, IndexError):
                 continue
-            key = (r << 16) | (g << 8) | b
-            m[key] = pid
-    return m
+    return mapping
 
 
 def load_country_colors(path: Path) -> Dict[str, Tuple[int, int, int]]:
@@ -128,35 +123,35 @@ def load_tag_names_csv(assets_dir: Path) -> Dict[str, str]:
                 continue
             parts = [x.strip() for x in line.split(",")]
             if len(parts) >= 2:
-                tag, nm = parts[0].upper(), ",".join(parts[1:]).strip()
-                mapping[tag] = nm
+                tag, nm = parts[0].upper(), ",".join(parts[1:]).strip('"')
+                if _tag3.fullmatch(tag):
+                    mapping[tag] = nm
     return mapping
 
 
 def looks_unitish(s: str) -> bool:
+    """Heuristic to check if a name string refers to a unit instead of a country."""
     s2 = s.lower()
-    return any(w in s2 for w in UNIT_WORDS) or ("'s " in s2) or s2.endswith(" regiment")
+    return any(w in s2 for w in UNIT_WORDS) or ("'s " in s2)
 
 
-def country_label(tag: str, c: Dict[str, object], tag_names: Dict[str, str]) -> str:
+def get_country_label(tag: str, country_data: Dict[str, object], tag_names: Dict[str, str]) -> str:
     """
-    Always return a *country* name (never a ruler/unit/tag).
+    Return a display-friendly country name (never a ruler/unit/tag).
     Priority: custom names -> 'name' if safe -> tag_names.csv -> fallback dict -> TAG
     """
-    for k in ("custom_name", "country_name", "long_name"):
-        v = c.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    v = c.get("name")
-    if isinstance(v, str):
-        s = v.strip()
+    for key in ("custom_name", "country_name", "long_name"):
+        val = country_data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+            
+    name_val = country_data.get("name")
+    if isinstance(name_val, str):
+        s = name_val.strip()
         if s and not _tag3.fullmatch(s) and not _name_like_person.match(s) and not looks_unitish(s):
             return s
-    if tag in tag_names:
-        return tag_names[tag]
-    if tag in TAG_NAME_FALLBACK:
-        return TAG_NAME_FALLBACK[tag]
-    return tag
+            
+    return tag_names.get(tag, TAG_NAME_FALLBACK.get(tag, tag))
 
 
 # -------------------------- parsing save -------------------------------------
@@ -166,103 +161,139 @@ class Country:
     tag: str
     raw: Dict[str, object]
 
-
-def parse_countries_block(save: str) -> Dict[str, Country]:
+def parse_countries_block(save_text: str) -> Dict[str, Country]:
+    """Parses the 'countries' block from the save file."""
     out: Dict[str, Country] = {}
-    m = re.search(r"\bcountries\s*=\s*\{(.*)\n\}\n", save, flags=re.S)
-    if not m:
+    countries_match = re.search(r"\ncountries\s*=\s*\{", save_text)
+    if not countries_match:
         return out
-    block = m.group(1)
-    for m2 in re.finditer(r"\n\s*([A-Z]{3})\s*=\s*\{(.*?)\n\s*\}", block, flags=re.S):
-        tag, body = m2.group(1), m2.group(2)
-        d: Dict[str, object] = {}
-        for key in (
-            "name", "custom_name", "country_name", "long_name",
-            "treasury", "inflation", "income", "corruption",
-            "war_exhaustion", "manpower", "max_manpower",
-            "land_forcelimit", "army_tradition", "army_professionalism",
-            "adm_tech", "dip_tech", "mil_tech", "technology_group",
-            "legitimacy", "republican_tradition", "horde_unity", "stability",
-        ):
-            mm = re.search(rf"\b{key}\s*=\s*([\-\d\.]+|\"[^\"]*\")", body)
-            if mm:
-                val = mm.group(1)
-                if val.startswith('"') and val.endswith('"'):
-                    d[key] = val.strip('"')
-                else:
-                    try:
-                        d[key] = float(val) if "." in val else int(val)
-                    except Exception:
-                        d[key] = val
-        loans_block = re.search(r"\bloans\s*=\s*\{([^}]*)\}", body, flags=re.S)
-        if loans_block:
-            d["loans"] = len(re.findall(r"=\s*\{", loans_block.group(1)))
-        out[tag] = Country(tag, d)
+
+    # Find the corresponding closing brace for the countries block
+    start_index = countries_match.end()
+    brace_level = 1
+    end_index = -1
+    for i in range(start_index, len(save_text)):
+        if save_text[i] == '{':
+            brace_level += 1
+        elif save_text[i] == '}':
+            brace_level -= 1
+            if brace_level == 0:
+                end_index = i
+                break
+    
+    if end_index == -1:
+        return out # Malformed file
+
+    countries_block = save_text[start_index:end_index]
+
+    for m in re.finditer(r"\n\s*([A-Z]{3})\s*=\s*\{(.*?)\n\s*\}", countries_block, flags=re.S):
+        tag, body = m.group(1), m.group(2)
+        data: Dict[str, object] = {}
+        
+        # Regex to find key = value or key = "value" pairs
+        for item_match in re.finditer(r"\b(\w+)\s*=\s*(\S+)", body):
+            key, val_str = item_match.group(1), item_match.group(2)
+            if '"' in val_str:
+                data[key] = val_str.strip('"')
+            else:
+                try:
+                    data[key] = float(val_str) if "." in val_str else int(val_str)
+                except ValueError:
+                    data[key] = val_str
+
+        # Special handling for blocks like 'loans'
+        loans_match = re.search(r"\bloans\s*=\s*\{([^}]*)\}", body, flags=re.S)
+        if loans_match:
+            data["loans"] = len(re.findall(r"\bloan\s*=\s*\{", loans_match.group(1)))
+            
+        out[tag] = Country(tag, data)
     return out
 
 
 def parse_province_owners(save: str) -> Dict[int, str]:
-    """
-    Best-effort province owner map. Handles:
-      province = { id=123 ... owner=TAG ... }
-      id=123 ... owner=TAG ... (within province scope)
-    """
+    """More robustly finds province owners, handling nested structures."""
     owners: Dict[int, str] = {}
-    for m in re.finditer(r"province\s*=\s*\{(.*?)\}", save, flags=re.S):
-        body = m.group(1)
-        mid = re.search(r"\bid\s*=\s*(\d+)", body)
-        mo = re.search(r"\bower\s*=\s*([A-Z]{3})", body)
-        if mid and mo:
-            owners[int(mid.group(1))] = mo.group(1)
-    if owners:
-        return owners
-    for m in re.finditer(r"\bid\s*=\s*(\d+)(?:(?!\bid\s*=)[\s\S])*?\bower\s*=\s*([A-Z]{3})", save):
-        owners[int(m.group(1))] = m.group(2)
+    # Iterate through top-level province definitions: -[number]={ ... }
+    for m in re.finditer(r"-\d+\s*=\s*\{", save):
+        start = m.end()
+        brace_level = 1
+        for i in range(start, len(save)):
+            if save[i] == '{':
+                brace_level += 1
+            elif save[i] == '}':
+                brace_level -= 1
+                if brace_level == 0:
+                    body = save[start:i]
+                    owner_match = re.search(r"\bower\s*=\s*\"?([A-Z]{3})\"?", body)
+                    if owner_match:
+                        # The province ID is the number in "-[number]="
+                        pid = int(m.group(0).split('=')[0].strip().replace('-', ''))
+                        owners[pid] = owner_match.group(1)
+                    break
     return owners
 
 
 def parse_province_blocks(save: str) -> Dict[int, Dict[str, object]]:
+    """Parses development and other data from province blocks."""
     out: Dict[int, Dict[str, object]] = {}
-    for m in re.finditer(r"\bprovince\s*=\s*\{(.*?)\}", save, flags=re.S):
-        body = m.group(1)
-        mid = re.search(r"\bid\s*=\s*(\d+)", body)
-        if not mid:
+    # Regex to find province blocks, which are typically identified by a negative number key
+    for m in re.finditer(r"(-\d+)\s*=\s*\{", save):
+        pid = int(m.group(1).strip('-'))
+        start = m.end()
+        brace_level = 1
+        body = ""
+        for i in range(start, len(save)):
+            if save[i] == '{':
+                brace_level += 1
+            elif save[i] == '}':
+                brace_level -= 1
+                if brace_level == 0:
+                    body = save[start:i]
+                    break
+        
+        if not body:
             continue
-        pid = int(mid.group(1))
+
         d: Dict[str, object] = {}
-        for key in ("base_tax", "base_production", "base_manpower",
-                    "development", "total_development", "dev", "curr_development"):
-            mm = re.search(rf"\b{key}\s*=\s*([\-\d\.]+)", body)
-            if mm:
-                try:
-                    d[key] = float(mm.group(1))
-                except Exception:
-                    pass
-        hist = re.search(r"\bhistory\s*=\s*\{([^}]*)\}", body, flags=re.S)
-        if hist:
-            hb = hist.group(1)
+        # Find all simple key=value pairs
+        for item_match in re.finditer(r"\b(\w+)\s*=\s*([\d\.]+)", body):
+            key, val_str = item_match.group(1), item_match.group(2)
+            try:
+                d[key] = float(val_str)
+            except ValueError:
+                pass
+        
+        # Handle history block separately for base values
+        hist_match = re.search(r"\bhistory\s*=\s*\{([^}]*)\}", body, flags=re.S)
+        if hist_match:
+            hist_body = hist_match.group(1)
             for key in ("base_tax", "base_production", "base_manpower"):
-                mm = re.search(rf"\b{key}\s*=\s*([\-\d\.]+)", hb)
-                if mm:
+                val_match = re.search(rf"\b{key}\s*=\s*([\d\.]+)", hist_body)
+                if val_match:
                     try:
-                        d[key] = float(mm.group(1))
-                    except Exception:
+                        d[key] = float(val_match.group(1))
+                    except ValueError:
                         pass
         if d:
             out[pid] = d
     return out
 
 
-def prov_development(p: Dict[str, object]) -> float:
-    bt, bp, bm = p.get("base_tax"), p.get("base_production"), p.get("base_manpower")
-    if isinstance(bt, (int, float)) and isinstance(bp, (int, float)) and isinstance(bm, (int, float)):
-        return float(bt) + float(bp) + float(bm)
-    for k in ("development", "total_development", "dev", "curr_development"):
-        v = p.get(k)
-        try:
-            return float(v)  # type: ignore[arg-type]
-        except Exception:
-            pass
+def get_province_development(p_data: Dict[str, object]) -> float:
+    """Calculates total development from province data."""
+    # First, try explicit total development fields
+    for key in ("development", "total_development", "dev", "curr_development"):
+        val = p_data.get(key)
+        if isinstance(val, (int, float)):
+            return float(val)
+            
+    # Fallback to summing base values
+    tax = p_data.get("base_tax", 0.0)
+    prod = p_data.get("base_production", 0.0)
+    manp = p_data.get("base_manpower", 0.0)
+    if isinstance(tax, (int, float)) and isinstance(prod, (int, float)) and isinstance(manp, (int, float)):
+        return float(tax) + float(prod) + float(manp)
+        
     return 0.0
 
 
@@ -270,100 +301,68 @@ def prov_development(p: Dict[str, object]) -> float:
 
 def parse_battles(save: str, tag_to_name: Dict[str, str]) -> List[Dict[str, object]]:
     """
-    Returns list of battles with casualties/attrition. Tries multiple patterns:
-      battle = { attacker = TAG defender = TAG ... attacker_losses = 1234 defender_losses = 567 }
-      combat = { ... attacker = TAG defender = TAG ... attacker_casualties = { ... } ... }
-    If fields are missing, leaves them blank.
+    Returns list of battles with casualties/attrition.
+    Searches for 'battle={...}' or 'combat={...}' blocks.
     """
     results: List[Dict[str, object]] = []
-
-    # Pattern 1: compact battle blocks
-    for m in re.finditer(r"\bbattle\s*=\s*\{([^}]*)\}", save, flags=re.S):
+    
+    # This single regex finds either 'battle' or 'combat' blocks
+    for m in re.finditer(r"\b(?:battle|combat)\s*=\s*\{([^}]*)\}", save, flags=re.S):
         body = m.group(1)
-        attacker = _m(body, r"\battacker\s*=\s*([A-Z]{3})")
-        defender = _m(body, r"\bdefender\s*=\s*([A-Z]{3})")
-        winner = _m(body, r"\bwinner\s*=\s*([A-Z]{3})")
-        date = _m(body, r"\bdate\s*=\s*([0-9\.\-]+)")
-        province_id = _m(body, r"\bprovince\s*=\s*(\d+)")
-        a_loss = _num(body, r"\battacker_(?:losses|casualties)\s*=\s*([0-9]+)")
-        d_loss = _num(body, r"\bdefender_(?:losses|casualties)\s*=\s*([0-9]+)")
-        a_attr = _num(body, r"\battacker_attrition(?:_losses)?\s*=\s*([0-9]+)")
-        d_attr = _num(body, r"\bdefender_attrition(?:_losses)?\s*=\s*([0-9]+)")
-        if attacker or defender:
-            results.append({
-                "date": date or "",
-                "province_id": int(province_id) if province_id else "",
-                "attacker": tag_to_name.get(attacker, attacker or ""),
-                "defender": tag_to_name.get(defender, defender or ""),
-                "winner": tag_to_name.get(winner, winner or ""),
-                "attacker_casualties": a_loss or "",
-                "defender_casualties": d_loss or "",
-                "attacker_attrition": a_attr or "",
-                "defender_attrition": d_attr or "",
-                "total_casualties": (a_loss or 0) + (d_loss or 0),
-                "total_attrition": (a_attr or 0) + (d_attr or 0),
-            })
+        
+        def _m(pat: str) -> Optional[str]:
+            mm = re.search(pat, body)
+            return mm.group(1) if mm else None
 
-    # Pattern 2: generic "combat" blocks
-    for m in re.finditer(r"\bcombat\s*=\s*\{([^}]*)\}", save, flags=re.S):
-        body = m.group(1)
-        attacker = _m(body, r"\battacker\s*=\s*([A-Z]{3})")
-        defender = _m(body, r"\bdefender\s*=\s*([A-Z]{3})")
-        winner = _m(body, r"\bwinner\s*=\s*([A-Z]{3})")
-        date = _m(body, r"\bdate\s*=\s*([0-9\.\-]+)")
-        province_id = _m(body, r"\bprovince\s*=\s*(\d+)")
-        a_loss = _num(body, r"\battacker_(?:losses|casualties)\s*=\s*([0-9]+)")
-        d_loss = _num(body, r"\bdefender_(?:losses|casualties)\s*=\s*([0-9]+)")
-        a_attr = _num(body, r"\battacker_attrition(?:_losses)?\s*=\s*([0-9]+)")
-        d_attr = _num(body, r"\bdefender_attrition(?:_losses)?\s*=\s*([0-9]+)")
-        if attacker or defender:
-            results.append({
-                "date": date or "",
-                "province_id": int(province_id) if province_id else "",
-                "attacker": tag_to_name.get(attacker, attacker or ""),
-                "defender": tag_to_name.get(defender, defender or ""),
-                "winner": tag_to_name.get(winner, winner or ""),
-                "attacker_casualties": a_loss or "",
-                "defender_casualties": d_loss or "",
-                "attacker_attrition": a_attr or "",
-                "defender_attrition": d_attr or "",
-                "total_casualties": (a_loss or 0) + (d_loss or 0),
-                "total_attrition": (a_attr or 0) + (d_attr or 0),
-            })
+        def _num(pat: str) -> Optional[int]:
+            mm = re.search(pat, body)
+            try:
+                return int(mm.group(1)) if mm else None
+            except (ValueError, TypeError):
+                return None
+
+        attacker = _m(r"\battacker\s*=\s*\"?([A-Z]{3})\"?")
+        defender = _m(r"\bdefender\s*=\s*\"?([A-Z]{3})\"?")
+        
+        if not (attacker and defender):
+            continue
+
+        winner = _m(r"\bwinner\s*=\s*\"?([A-Z]{3})\"?")
+        date = _m(r'\bdate\s*=\s*"([^"]*)"')
+        province_id = _num(r"\bprovince\s*=\s*(\d+)")
+        
+        a_loss = _num(r"\battacker_(?:losses|casualties)\s*=\s*(\d+)") or 0
+        d_loss = _num(r"\bdefender_(?:losses|casualties)\s*=\s*(\d+)") or 0
+        a_attr = _num(r"\battacker_attrition(?:_losses)?\s*=\s*(\d+)") or 0
+        d_attr = _num(r"\bdefender_attrition(?:_losses)?\s*=\s*(\d+)") or 0
+
+        results.append({
+            "date": date or "",
+            "province_id": province_id or "",
+            "attacker": tag_to_name.get(attacker, attacker),
+            "defender": tag_to_name.get(defender, defender),
+            "winner": tag_to_name.get(winner, winner or ""),
+            "attacker_casualties": a_loss,
+            "defender_casualties": d_loss,
+            "attacker_attrition": a_attr,
+            "defender_attrition": d_attr,
+            "total_casualties": a_loss + d_loss,
+            "total_attrition": a_attr + d_attr,
+        })
+        
     return results
-
-
-def _m(text: str, pat: str) -> Optional[str]:
-    mm = re.search(pat, text)
-    return mm.group(1) if mm else None
-
-
-def _num(text: str, pat: str) -> Optional[int]:
-    mm = re.search(pat, text)
-    try:
-        return int(mm.group(1)) if mm else None
-    except Exception:
-        return None
 
 
 # ------------------------ color utilities & rendering ------------------------
 
 def stable_color_for_tag(tag: str) -> Tuple[int, int, int]:
-    h = (hash(tag) & 0xFFFFFF) / 0xFFFFFF
-    s, v = 0.65, 0.9
-    i = int(h * 6)
-    f = h * 6 - i
-    p = int(255 * v * (1 - s))
-    q = int(255 * v * (1 - s * f))
-    t = int(255 * v * (1 - s * (1 - f)))
-    vv = int(255 * v)
-    i %= 6
-    if i == 0: return (vv, t, p)
-    if i == 1: return (q, vv, p)
-    if i == 2: return (p, vv, t)
-    if i == 3: return (p, q, vv)
-    if i == 4: return (t, p, vv)
-    return (vv, p, q)
+    """Generates a deterministic, visually distinct color for a given tag string."""
+    h = (hash(tag) & 0xFFFFFF)
+    r = (h >> 16) & 0xFF
+    g = (h >> 8) & 0xFF
+    b = h & 0xFF
+    # Boost saturation and value to avoid muddy colors
+    return (min(255, r + 50), min(255, g + 50), min(255, b + 50))
 
 
 def pack_rgb(arr: np.ndarray) -> np.ndarray:
@@ -374,90 +373,100 @@ def pack_rgb(arr: np.ndarray) -> np.ndarray:
 
 def map_colors_to_pid(packed_rgb: np.ndarray, color_to_pid: Dict[int, int]) -> np.ndarray:
     """Vectorized mapping of packed colors -> province ids (0 when missing)."""
-    keys = np.fromiter(color_to_pid.keys(), dtype=np.uint32)
-    vals = np.fromiter(color_to_pid.values(), dtype=np.int32)
-    order = np.argsort(keys)
-    keys, vals = keys[order], vals[order]
+    # Prepare sorted lookup arrays for efficient searching
+    unique_colors = np.array(list(color_to_pid.keys()), dtype=np.uint32)
+    pids_for_colors = np.array([color_to_pid[c] for c in unique_colors], dtype=np.int32)
+    
+    sort_indices = np.argsort(unique_colors)
+    sorted_colors = unique_colors[sort_indices]
+    sorted_pids = pids_for_colors[sort_indices]
 
-    flat = packed_rgb.reshape(-1)
-    idx = np.searchsorted(keys, flat)
-    match = (idx < keys.size) & (keys[idx] == flat)
-    out = np.zeros_like(flat, dtype=np.int32)
-    out[match] = vals[idx[match]]
+    # Find where the image's colors would be inserted in the sorted list
+    flat_packed = packed_rgb.flatten()
+    indices = np.searchsorted(sorted_colors, flat_packed)
+    
+    # Create an output array initialized to 0 (for unmapped pixels)
+    out = np.zeros_like(flat_packed, dtype=np.int32)
+    
+    # Find valid matches and map them
+    valid_mask = (indices < len(sorted_colors)) & (sorted_colors[indices] == flat_packed)
+    out[valid_mask] = sorted_pids[indices[valid_mask]]
+    
     return out.reshape(packed_rgb.shape)
 
 
 def render_map(
     provinces_bmp: Path,
     defmap: Dict[int, int],         # packedRGB -> pid
-    owners: Dict[int, str],         # pid -> tag
-    sea_ids: set[int],
-    tag_colors: Dict[str, Tuple[int, int, int]],
+    pid_to_color: Dict[int, Tuple[int, int, int]], # pid -> (r,g,b)
     out_path: Path,
     scale: float = 0.75,
-    chunk: int | None = None,       # process rows in bands
+    chunk_height: int | None = None, # process rows in bands
 ) -> None:
+    """Renders the final political map."""
     img = Image.open(provinces_bmp).convert("RGB")
     W, H = img.size
 
-    def color_for_pid(pid: int) -> Tuple[int, int, int]:
-        if pid in sea_ids:
-            return (70, 90, 130)  # sea/ogre-blue
-        tag = owners.get(pid)
-        if not tag:
-            return (30, 30, 30)
-        return tag_colors.get(tag, stable_color_for_tag(tag))
+    # Create the final output image canvas
+    out_img_arr = np.zeros((H, W, 3), dtype=np.uint8)
+    
+    # Determine processing band height
+    band_height = chunk_height if chunk_height and chunk_height > 0 else H
 
-    out = np.zeros((H, W, 3), dtype=np.uint8)
-    band = max(1, int(chunk)) if chunk else H
+    for y_start in range(0, H, band_height):
+        y_end = min(H, y_start + band_height)
+        
+        # Crop a horizontal band from the source image
+        band_img = img.crop((0, y_start, W, y_end))
+        rgb_band = np.array(band_img, dtype=np.uint8)
+        
+        # Convert this band to province IDs
+        packed_band = pack_rgb(rgb_band)
+        pid_band = map_colors_to_pid(packed_band, defmap)
+        
+        # Create RGB channels for the output band
+        r_ch = np.zeros_like(pid_band, dtype=np.uint8)
+        g_ch = np.zeros_like(pid_band, dtype=np.uint8)
+        b_ch = np.zeros_like(pid_band, dtype=np.uint8)
+        
+        # Use the pre-calculated pid_to_color map to fill channels
+        for pid, (r, g, b) in pid_to_color.items():
+            mask = (pid_band == pid)
+            r_ch[mask] = r
+            g_ch[mask] = g
+            b_ch[mask] = b
+            
+        # Place the colored channels into the final output array
+        out_img_arr[y_start:y_end, :, 0] = r_ch
+        out_img_arr[y_start:y_end, :, 1] = g_ch
+        out_img_arr[y_start:y_end, :, 2] = b_ch
 
-    y = 0
-    while y < H:
-        y1 = min(H, y + band)
-        rgb = np.array(img.crop((0, y, W, y1)), dtype=np.uint8)   # h x W x 3
-        packed = pack_rgb(rgb)                                    # h x W
-        pid = map_colors_to_pid(packed, defmap)                   # h x W
-
-        band_pids = np.unique(pid)
-        lut: Dict[int, Tuple[int, int, int]] = {int(p): color_for_pid(int(p)) for p in band_pids}
-        r = np.zeros_like(pid, dtype=np.uint8)
-        g = np.zeros_like(pid, dtype=np.uint8)
-        b = np.zeros_like(pid, dtype=np.uint8)
-        for p, (rr, gg, bb) in lut.items():
-            mask = (pid == p)
-            r[mask] = rr
-            g[mask] = gg
-            b[mask] = bb
-        out[y:y1, :, 0] = r
-        out[y:y1, :, 1] = g
-        out[y:y1, :, 2] = b
-
-        y = y1
-
-    final = Image.fromarray(out, mode="RGB")
+    # Create image from the final array
+    final_img = Image.fromarray(out_img_arr, mode="RGB")
     if scale and scale != 1.0:
-        final = final.resize((int(W * scale), int(H * scale)), Image.NEAREST)
-    final.save(out_path)
+        final_img = final_img.resize((int(W * scale), int(H * scale)), Image.NEAREST)
+        
+    final_img.save(out_path)
 
 
 # ------------------------ CSV output -----------------------------------------
 
 def write_csv(path: Path, rows: List[Dict[str, object]], columns: List[str]) -> None:
+    """Writes a list of dictionaries to a CSV file."""
     with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=columns)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in columns})
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # ------------------------ main ------------------------------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="EU4 Save Viewer and Map Renderer")
     ap.add_argument("save", help=".eu4 save file (text or zipped)")
-    ap.add_argument("--assets", default=".", help="Folder containing provinces.bmp, definition.csv, default.map, 00_country_colors.txt")
-    ap.add_argument("--out", default="world_map.png", help="Output map path (PNG)")
-    ap.add_argument("--scale", type=float, default=0.75, help="Downscale factor for output image")
+    ap.add_argument("--assets", default=".", help="Directory with game assets (provinces.bmp, etc.)")
+    ap.add_argument("--out", default="world_map.png", help="Output path for the rendered map (PNG)")
+    ap.add_argument("--scale", type=float, default=0.75, help="Downscale factor for the output image")
     ap.add_argument("--chunk", type=int, default=None, help="Row band height for low-memory rendering (e.g., 64)")
     args = ap.parse_args()
 
@@ -465,144 +474,131 @@ def main() -> int:
     provinces_bmp = assets / "provinces.bmp"
     definition_csv = assets / "definition.csv"
     default_map = assets / "default.map"
-    country_colors = assets / "00_country_colors.txt"
+    country_colors_txt = assets / "00_country_colors.txt"
 
-    # Basic existence checks
-    required = [provinces_bmp, definition_csv, default_map]
-    missing = [p.name for p in required if not p.exists()]
-    if missing:
-        # Quiet failure: caller (bot) will translate to a friendly message
-        return 2
+    # Check for essential asset files
+    for p in [provinces_bmp, definition_csv, default_map]:
+        if not p.exists():
+            print(f"Error: Missing essential asset file: {p.name}", file=sys.stderr)
+            return 2
 
     # Load assets
     defmap = load_definition_csv(definition_csv)
     sea_ids = load_default_map_sea_ids(default_map.read_text(encoding="latin-1", errors="ignore"))
-    tag_colors = load_country_colors(country_colors)
+    tag_colors = load_country_colors(country_colors_txt)
     tag_names = load_tag_names_csv(assets)
 
-    # Load & parse save
+    # Load & parse save file
     save_text = read_text_save(Path(args.save))
     owners = parse_province_owners(save_text)
     countries = parse_countries_block(save_text)
     prov_blocks = parse_province_blocks(save_text)
 
     # Build tag -> friendly name table once
-    tag_to_name: Dict[str, str] = {tag: country_label(tag, c.raw, tag_names) for tag, c in countries.items()}
+    tag_to_name: Dict[str, str] = {tag: get_country_label(tag, c.raw, tag_names) for tag, c in countries.items()}
 
-    # Per-country stats (always use friendly names)
+    # Aggregate per-country stats
     dev_by_country: Dict[str, float] = {}
     count_by_country: Dict[str, int] = {}
     for pid, tag in owners.items():
-        name = tag_to_name.get(tag, TAG_NAME_FALLBACK.get(tag, tag))
+        name = tag_to_name.get(tag, tag)
         count_by_country[name] = count_by_country.get(name, 0) + 1
-        dev_by_country[name] = dev_by_country.get(name, 0.0) + prov_development(prov_blocks.get(pid, {}))
+        dev_by_country[name] = dev_by_country.get(name, 0.0) + get_province_development(prov_blocks.get(pid, {}))
 
-    rows_overview: List[Dict[str, object]] = []
-    rows_econ: List[Dict[str, object]] = []
-    rows_mil: List[Dict[str, object]] = []
-    rows_dev: List[Dict[str, object]] = []
-    rows_tech: List[Dict[str, object]] = []
-    rows_leg: List[Dict[str, object]] = []
-
+    # Prepare data rows for CSV output
+    all_rows = []
     for tag, c in countries.items():
         cdata = c.raw
-        name = tag_to_name.get(tag, TAG_NAME_FALLBACK.get(tag, tag))
+        name = tag_to_name.get(tag, tag)
         prov_count = count_by_country.get(name, 0)
         total_dev = dev_by_country.get(name, 0.0)
-        avg_dev = (total_dev / prov_count) if prov_count else 0.0
-
-        # simple composite for army quality if fields exist
+        
+        # Calculate army quality score
         aq = 0.0
-        for k, wt in (("army_tradition", 0.5), ("army_professionalism", 0.5)):
-            v = cdata.get(k)
-            if isinstance(v, (int, float)):
-                aq += wt * float(v)
+        tradition = cdata.get("army_tradition", 0.0)
+        prof = cdata.get("army_professionalism", 0.0)
+        if isinstance(tradition, (int, float)) and isinstance(prof, (int, float)):
+            aq = (0.5 * float(tradition)) + (0.5 * float(prof))
 
-        rows_overview.append({
+        all_rows.append({
             "country": name,
             "province_count": prov_count,
             "total_development": round(total_dev, 2),
-            "avg_development": round(avg_dev, 2),
-            "income": cdata.get("income", ""),
-            "manpower": cdata.get("manpower", ""),
-            "army_quality_score": round(aq, 2) if aq else "",
-        })
-
-        rows_econ.append({
-            "country": name,
+            "avg_development": round(total_dev / prov_count, 2) if prov_count else 0.0,
             "income": cdata.get("income", ""),
             "treasury": cdata.get("treasury", ""),
             "inflation": cdata.get("inflation", ""),
             "loans": cdata.get("loans", ""),
             "war_exhaustion": cdata.get("war_exhaustion", ""),
             "corruption": cdata.get("corruption", ""),
-        })
-
-        rows_mil.append({
-            "country": name,
-            "army_quality_score": round(aq, 2) if aq else "",
             "manpower": cdata.get("manpower", ""),
             "max_manpower": cdata.get("max_manpower", ""),
             "land_forcelimit": cdata.get("land_forcelimit", ""),
-            "army_tradition": cdata.get("army_tradition", ""),
-            "army_professionalism": cdata.get("army_professionalism", ""),
-        })
-
-        rows_dev.append({
-            "country": name,
-            "province_count": prov_count,
-            "total_development": round(total_dev, 2),
-            "avg_development": round(avg_dev, 2),
-        })
-
-        rows_tech.append({
-            "country": name,
+            "army_tradition": tradition,
+            "army_professionalism": prof,
+            "army_quality_score": round(aq, 2) if aq else "",
             "adm_tech": cdata.get("adm_tech", ""),
             "dip_tech": cdata.get("dip_tech", ""),
             "mil_tech": cdata.get("mil_tech", ""),
             "technology_group": cdata.get("technology_group", ""),
-        })
-
-        rows_leg.append({
-            "country": name,
             "legitimacy": cdata.get("legitimacy", ""),
             "republican_tradition": cdata.get("republican_tradition", ""),
             "horde_unity": cdata.get("horde_unity", ""),
             "stability": cdata.get("stability", ""),
         })
 
-    # Battles (best-effort)
+    # Battles
     battles = parse_battles(save_text, tag_to_name)
 
-    # Write CSVs next to assets
-    write_csv(assets / "overview.csv", rows_overview,
+    # Write all CSVs
+    write_csv(assets / "overview.csv", all_rows,
               ["country", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"])
-    write_csv(assets / "economy.csv", rows_econ,
+    write_csv(assets / "economy.csv", all_rows,
               ["country", "income", "treasury", "inflation", "loans", "war_exhaustion", "corruption"])
-    write_csv(assets / "military.csv", rows_mil,
+    write_csv(assets / "military.csv", all_rows,
               ["country", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"])
-    write_csv(assets / "development.csv", rows_dev,
+    write_csv(assets / "development.csv", all_rows,
               ["country", "province_count", "total_development", "avg_development"])
-    write_csv(assets / "technology.csv", rows_tech,
+    write_csv(assets / "technology.csv", all_rows,
               ["country", "adm_tech", "dip_tech", "mil_tech", "technology_group"])
-    write_csv(assets / "legitimacy.csv", rows_leg,
+    write_csv(assets / "legitimacy.csv", all_rows,
               ["country", "legitimacy", "republican_tradition", "horde_unity", "stability"])
     write_csv(assets / "battles.csv", battles,
               ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties",
                "attacker_attrition", "defender_attrition", "total_casualties", "total_attrition"])
 
-    # Render map
-    # Owners dict currently keyed by pid->tag; we still need tag->color mapping, so keep tags here.
+    # --- Efficient Map Rendering ---
+    # 1. Create a single, comprehensive lookup table from Province ID -> Final Color
+    pid_to_final_color: Dict[int, Tuple[int, int, int]] = {}
+    all_pids = set(defmap.values())
+    
+    # Default color for unowned land
+    unowned_land_color = (50, 50, 50)
+    sea_color = (70, 90, 130)
+
+    for pid in all_pids:
+        if pid in sea_ids:
+            pid_to_final_color[pid] = sea_color
+            continue
+        
+        owner_tag = owners.get(pid)
+        if owner_tag:
+            # Use defined country color, or generate a stable one
+            pid_to_final_color[pid] = tag_colors.get(owner_tag, stable_color_for_tag(owner_tag))
+        else:
+            pid_to_final_color[pid] = unowned_land_color
+
+    # 2. Render the map using this efficient lookup
     render_map(
         provinces_bmp=provinces_bmp,
         defmap=defmap,
-        owners=owners,
-        sea_ids=sea_ids,
-        tag_colors=load_country_colors(country_colors),
+        pid_to_color=pid_to_final_color,
         out_path=Path(args.out).resolve(),
         scale=args.scale,
-        chunk=args.chunk,
+        chunk_height=args.chunk,
     )
+    
+    print("Processing complete.")
     return 0
 
 
