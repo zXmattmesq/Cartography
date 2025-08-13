@@ -18,7 +18,7 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -143,11 +143,11 @@ def get_country_label(tag: str, country_data: Dict[str, object], tag_names: Dict
     for key in ("custom_name", "country_name", "long_name"):
         val = country_data.get(key)
         if isinstance(val, str) and val.strip():
-            return val.strip()
+            return val.strip().strip('"')
             
     name_val = country_data.get("name")
     if isinstance(name_val, str):
-        s = name_val.strip()
+        s = name_val.strip().strip('"')
         if s and not _tag3.fullmatch(s) and not _name_like_person.match(s) and not looks_unitish(s):
             return s
             
@@ -179,34 +179,59 @@ class Country:
     raw: Dict[str, object]
 
 def parse_countries_block(save_text: str) -> Dict[str, Country]:
-    """Parses the 'countries' block from the save file."""
+    """Parses the 'countries' block from the save file with robust block handling."""
     out: Dict[str, Country] = {}
     countries_block = _find_block_content(save_text, "countries")
     if not countries_block:
         return out
 
-    for m in re.finditer(r'([A-Z]{3})\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}', countries_block):
-        tag, body = m.group(1), m.group(2)
+    # Use a robust iterator that finds the start of each country block
+    for m in re.finditer(r'\b([A-Z]{3})\s*=\s*\{', countries_block):
+        tag = m.group(1)
+        block_start = m.end()
+        
+        # Find the end of the block by counting braces
+        brace_level = 1
+        body = ""
+        for i in range(block_start, len(countries_block)):
+            char = countries_block[i]
+            if char == '{':
+                brace_level += 1
+            elif char == '}':
+                brace_level -= 1
+                if brace_level == 0:
+                    body = countries_block[block_start:i]
+                    break
+        
+        if not body:
+            continue
+
         data: Dict[str, object] = {}
         
-        for item_match in re.finditer(r"(\w+)\s*=\s*(-?[\d\.]+|\"[^\"]*\")", body):
+        # This regex finds top-level key-value pairs (numbers or quoted strings)
+        for item_match in re.finditer(r"^\s*(\w+)\s*=\s*(-?[\d\.]+|\"[^\"]*\")", body, re.MULTILINE):
             key, val_str = item_match.group(1), item_match.group(2).strip('"')
             try:
                 data[key] = float(val_str) if "." in val_str else int(val_str)
             except ValueError:
                 data[key] = val_str
 
+        # Special handling for nested 'loans' block
         loans_match = re.search(r"loans\s*=\s*\{", body)
         if loans_match:
             loan_body_start = loans_match.end()
             brace_level = 1
+            loan_block_end = -1
             for i in range(loan_body_start, len(body)):
                 if body[i] == '{': brace_level += 1
                 elif body[i] == '}': brace_level -= 1
                 if brace_level == 0:
-                    loan_block = body[loan_body_start:i]
-                    data["loans"] = len(re.findall(r"loan\s*=\s*\{", loan_block))
+                    loan_block_end = i
                     break
+            if loan_block_end != -1:
+                loan_block = body[loan_body_start:loan_block_end]
+                data["loans"] = len(re.findall(r"loan\s*=\s*\{", loan_block))
+        
         out[tag] = Country(tag, data)
     return out
 
@@ -244,8 +269,8 @@ def parse_province_data(save_text: str) -> Tuple[Dict[int, str], Dict[int, Dict[
         if not body:
             continue
 
-        # Parse owner from the body
-        owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', body)
+        # Parse owner from the body (quotes are now optional)
+        owner_match = re.search(r'owner\s*=\s*"?([A-Z]{3})"?', body)
         if owner_match:
             owners[pid] = owner_match.group(1)
 
@@ -258,6 +283,7 @@ def parse_province_data(save_text: str) -> Tuple[Dict[int, str], Dict[int, Dict[
             except ValueError:
                 pass
         
+        # Also check inside the history block for development
         hist_match = re.search(r"history\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}", body)
         if hist_match:
             hist_body = hist_match.group(1)
@@ -296,47 +322,56 @@ def parse_battles(save: str, tag_to_name: Dict[str, str]) -> List[Dict[str, obje
     """Returns list of battles with casualties/attrition."""
     results: List[Dict[str, object]] = []
     
-    for m in re.finditer(r"\b(?:battle|combat)\s*=\s*\{([^}]*)\}", save, flags=re.S):
+    # Find the war history block, which contains battles
+    war_history_block = _find_block_content(save, "war_history")
+    if not war_history_block:
+        # Fallback for older save formats
+        war_history_block = save
+
+    for m in re.finditer(r"\b(?:battle|combat)\s*=\s*\{([\s\S]*?)\n\t\t\}", war_history_block, flags=re.S):
         body = m.group(1)
         
         def _m(pat: str) -> Optional[str]:
             mm = re.search(pat, body)
-            return mm.group(1) if mm else None
+            return mm.group(1).strip('"') if mm else None
 
-        def _num(pat: str) -> Optional[int]:
-            mm = re.search(pat, body)
+        def _num(pat: str) -> float:
+            s = _m(pat)
             try:
-                return int(mm.group(1)) if mm else None
+                return float(s) if s else 0.0
             except (ValueError, TypeError):
-                return None
+                return 0.0
 
-        attacker = _m(r"\battacker\s*=\s*\"?([A-Z]{3})\"?")
-        defender = _m(r"\bdefender\s*=\s*\"?([A-Z]{3})\"?")
+        attacker_tag = _m(r"\battacker\s*=\s*\"?([A-Z]{3})\"?")
+        defender_tag = _m(r"\bdefender\s*=\s*\"?([A-Z]{3})\"?")
         
-        if not (attacker and defender):
+        if not (attacker_tag and defender_tag):
             continue
 
-        winner = _m(r"\bwinner\s*=\s*\"?([A-Z]{3})\"?")
-        date = _m(r'\bdate\s*=\s*"([^"]*)"')
-        province_id = _num(r"\bprovince\s*=\s*(\d+)")
+        winner_tag = _m(r"\bresult\s*=\s*\"?(\w+)\"?") # 'yes' for attacker win
+        winner = attacker_tag if winner_tag == 'yes' else defender_tag
+
+        # Find losses within the respective combatant blocks
+        attacker_losses = 0.0
+        defender_losses = 0.0
         
-        a_loss = _num(r"\battacker_(?:losses|casualties)\s*=\s*(\d+)") or 0
-        d_loss = _num(r"\bdefender_(?:losses|casualties)\s*=\s*(\d+)") or 0
-        a_attr = _num(r"\battacker_attrition(?:_losses)?\s*=\s*(\d+)") or 0
-        d_attr = _num(r"\bdefender_attrition(?:_losses)?\s*=\s*(\d+)") or 0
+        attacker_block_m = re.search(r"attacker\s*=\s*\{([\s\S]+?)\n\t\t\}", body)
+        if attacker_block_m:
+            attacker_losses = _num(r"losses\s*=\s*([\d\.]+)")
+
+        defender_block_m = re.search(r"defender\s*=\s*\{([\s\S]+?)\n\t\t\}", body)
+        if defender_block_m:
+            defender_losses = _num(r"losses\s*=\s*([\d\.]+)")
 
         results.append({
-            "date": date or "",
-            "province_id": province_id or "",
-            "attacker": tag_to_name.get(attacker, attacker),
-            "defender": tag_to_name.get(defender, defender),
+            "date": _m(r'\bdate\s*=\s*("[\d\.]+")') or "",
+            "province_id": _m(r"\bprovince\s*=\s*(\d+)") or "",
+            "attacker": tag_to_name.get(attacker_tag, attacker_tag),
+            "defender": tag_to_name.get(defender_tag, defender_tag),
             "winner": tag_to_name.get(winner, winner or ""),
-            "attacker_casualties": a_loss,
-            "defender_casualties": d_loss,
-            "attacker_attrition": a_attr,
-            "defender_attrition": d_attr,
-            "total_casualties": a_loss + d_loss,
-            "total_attrition": a_attr + d_attr,
+            "attacker_casualties": int(attacker_losses),
+            "defender_casualties": int(defender_losses),
+            "total_casualties": int(attacker_losses + defender_losses),
         })
         
     return results
@@ -379,7 +414,12 @@ def render_map(
     chunk_height: int | None = None,
 ) -> None:
     """Renders the final political map."""
-    img = Image.open(provinces_bmp).convert("RGB")
+    try:
+        img = Image.open(provinces_bmp).convert("RGB")
+    except FileNotFoundError:
+        print(f"Error: provinces.bmp not found at {provinces_bmp}", file=sys.stderr)
+        return
+        
     W, H = img.size
 
     out_img_arr = np.zeros((H, W, 3), dtype=np.uint8)
@@ -398,7 +438,7 @@ def render_map(
         g_ch = np.zeros_like(pid_band, dtype=np.uint8)
         b_ch = np.zeros_like(pid_band, dtype=np.uint8)
         
-        default_color = (0, 0, 0)
+        default_color = (128, 128, 128) # Grey for unspecified
         
         unique_pids_in_band = np.unique(pid_band)
         for pid in unique_pids_in_band:
@@ -447,18 +487,24 @@ def main() -> int:
     default_map = assets / "default.map"
     country_colors_txt = assets / "00_country_colors.txt"
 
-    for p in [provinces_bmp, definition_csv, default_map]:
+    for p in [provinces_bmp, definition_csv, default_map, country_colors_txt]:
         if not p.exists():
-            print(f"Error: Missing essential asset file: {p.name}", file=sys.stderr)
+            print(f"Error: Missing essential asset file: {p}", file=sys.stderr)
             return 2
 
+    print("Loading assets...")
     defmap = load_definition_csv(definition_csv)
     sea_ids = load_default_map_sea_ids(default_map.read_text(encoding="latin-1", errors="ignore"))
     tag_colors = load_country_colors(country_colors_txt)
     tag_names = load_tag_names_csv(assets)
 
+    print("Reading save file...")
     save_text = read_text_save(Path(args.save))
+    
+    print("Parsing countries...")
     countries = parse_countries_block(save_text)
+    
+    print("Parsing provinces...")
     owners, prov_blocks = parse_province_data(save_text)
 
     tag_to_name: Dict[str, str] = {tag: get_country_label(tag, c.raw, tag_names) for tag, c in countries.items()}
@@ -488,7 +534,7 @@ def main() -> int:
             "province_count": prov_count,
             "total_development": round(total_dev, 2),
             "avg_development": round(total_dev / prov_count, 2) if prov_count else 0.0,
-            "income": cdata.get("income", ""),
+            "income": cdata.get("last_month_income", cdata.get("income", "")),
             "treasury": cdata.get("treasury", ""),
             "inflation": cdata.get("inflation", ""),
             "loans": cdata.get("loans", ""),
@@ -510,42 +556,44 @@ def main() -> int:
             "stability": cdata.get("stability", ""),
         })
 
+    print("Parsing battles...")
     battles = parse_battles(save_text, tag_to_name)
 
-    write_csv(assets / "overview.csv", all_rows,
-              ["country", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"])
-    write_csv(assets / "economy.csv", all_rows,
-              ["country", "income", "treasury", "inflation", "loans", "war_exhaustion", "corruption"])
-    write_csv(assets / "military.csv", all_rows,
-              ["country", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"])
-    write_csv(assets / "development.csv", all_rows,
-              ["country", "province_count", "total_development", "avg_development"])
-    write_csv(assets / "technology.csv", all_rows,
-              ["country", "adm_tech", "dip_tech", "mil_tech", "technology_group"])
-    write_csv(assets / "legitimacy.csv", all_rows,
-              ["country", "legitimacy", "republican_tradition", "horde_unity", "stability"])
-    write_csv(assets / "battles.csv", battles,
-              ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties",
-               "attacker_attrition", "defender_attrition", "total_casualties", "total_attrition"])
+    print("Writing CSV files...")
+    # Write CSVs
+    overview_cols = ["country", "province_count", "total_development", "avg_development", "income", "manpower", "army_quality_score"]
+    economy_cols = ["country", "income", "treasury", "inflation", "loans", "war_exhaustion", "corruption"]
+    military_cols = ["country", "army_quality_score", "manpower", "max_manpower", "land_forcelimit", "army_tradition", "army_professionalism"]
+    dev_cols = ["country", "province_count", "total_development", "avg_development"]
+    tech_cols = ["country", "adm_tech", "dip_tech", "mil_tech", "technology_group"]
+    legitimacy_cols = ["country", "legitimacy", "republican_tradition", "horde_unity", "stability"]
+    battles_cols = ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties", "total_casualties"]
+    
+    write_csv(assets / "overview.csv", all_rows, overview_cols)
+    write_csv(assets / "economy.csv", all_rows, economy_cols)
+    write_csv(assets / "military.csv", all_rows, military_cols)
+    write_csv(assets / "development.csv", all_rows, dev_cols)
+    write_csv(assets / "technology.csv", all_rows, tech_cols)
+    write_csv(assets / "legitimacy.csv", all_rows, legitimacy_cols)
+    write_csv(assets / "battles.csv", battles, battles_cols)
 
     pid_to_final_color: Dict[int, Tuple[int, int, int]] = {}
-    all_pids = set(defmap.values())
     
     unowned_land_color = (80, 80, 80)
-    unspecified_country_color = (128, 128, 128)
     sea_color = (70, 90, 130)
 
-    for pid in all_pids:
+    for pid in defmap.values():
         if pid in sea_ids:
             pid_to_final_color[pid] = sea_color
             continue
         
         owner_tag = owners.get(pid)
         if owner_tag:
-            pid_to_final_color[pid] = tag_colors.get(owner_tag, unspecified_country_color)
+            pid_to_final_color[pid] = tag_colors.get(owner_tag, unowned_land_color)
         else:
             pid_to_final_color[pid] = unowned_land_color
 
+    print("Rendering map...")
     render_map(
         provinces_bmp=provinces_bmp,
         defmap=defmap,
