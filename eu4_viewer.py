@@ -156,14 +156,16 @@ def get_country_label(tag: str, country_data: Dict[str, object], tag_names: Dict
 
 # -------------------------- parsing save -------------------------------------
 
-def _find_block(text: str, key: str) -> Optional[str]:
+def _find_block_content(text: str, key: str) -> Optional[str]:
     """Finds and returns the content of a {...} block using brace counting."""
-    match = re.search(rf"\n{key}\s*=\s*\{{", text)
+    # Find the starting pattern: key={
+    match = re.search(rf"^{key}\s*=\s*\{{", text, re.MULTILINE)
     if not match:
         return None
     
     start_index = match.end()
     brace_level = 1
+    # Scan the rest of the text to find the matching closing brace
     for i in range(start_index, len(text)):
         if text[i] == '{':
             brace_level += 1
@@ -171,7 +173,7 @@ def _find_block(text: str, key: str) -> Optional[str]:
             brace_level -= 1
             if brace_level == 0:
                 return text[start_index:i]
-    return None # Unclosed block
+    return None # Return None if the block is unclosed
 
 @dataclass
 class Country:
@@ -181,28 +183,35 @@ class Country:
 def parse_countries_block(save_text: str) -> Dict[str, Country]:
     """Parses the 'countries' block from the save file."""
     out: Dict[str, Country] = {}
-    countries_block = _find_block(save_text, "countries")
+    countries_block = _find_block_content(save_text, "countries")
     if not countries_block:
         return out
 
-    for m in re.finditer(r"([A-Z]{3})\s*=\s*\{(.*?)\}", countries_block, flags=re.S):
+    # Iterate through TAG={...} definitions within the countries block
+    for m in re.finditer(r'([A-Z]{3})\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}', countries_block):
         tag, body = m.group(1), m.group(2)
         data: Dict[str, object] = {}
         
-        for item_match in re.finditer(r"\b(\w+)\s*=\s*(\S+)", body):
-            key, val_str = item_match.group(1), item_match.group(2)
-            if '"' in val_str:
-                data[key] = val_str.strip('"')
-            else:
-                try:
-                    data[key] = float(val_str) if "." in val_str else int(val_str)
-                except ValueError:
-                    data[key] = val_str
+        # Extract simple key=value pairs
+        for item_match in re.finditer(r"(\w+)\s*=\s*(-?[\d\.]+|\"[^\"]*\")", body):
+            key, val_str = item_match.group(1), item_match.group(2).strip('"')
+            try:
+                data[key] = float(val_str) if "." in val_str else int(val_str)
+            except ValueError:
+                data[key] = val_str
 
-        loans_match = re.search(r"\bloans\s*=\s*\{([^}]*)\}", body, flags=re.S)
+        # Specifically count loans within the loans={...} sub-block
+        loans_match = re.search(r"loans\s*=\s*\{", body)
         if loans_match:
-            data["loans"] = len(re.findall(r"\bloan\s*=\s*\{", loans_match.group(1)))
-            
+            loan_body_start = loans_match.end()
+            brace_level = 1
+            for i in range(loan_body_start, len(body)):
+                if body[i] == '{': brace_level += 1
+                elif body[i] == '}': brace_level -= 1
+                if brace_level == 0:
+                    loan_block = body[loan_body_start:i]
+                    data["loans"] = len(re.findall(r"loan\s*=\s*\{", loan_block))
+                    break
         out[tag] = Country(tag, data)
     return out
 
@@ -210,49 +219,68 @@ def parse_countries_block(save_text: str) -> Dict[str, Country]:
 def parse_province_owners(save_text: str) -> Dict[int, str]:
     """Parses the 'provinces' block to find the owner of each province."""
     owners: Dict[int, str] = {}
-    provinces_block = _find_block(save_text, "provinces")
+    provinces_block = _find_block_content(save_text, "provinces")
     if not provinces_block:
         print("Warning: 'provinces' block not found in save file.", file=sys.stderr)
         return {}
 
-    # Iterate over province entries. Format is -ID={...owner="TAG"...}
-    for m in re.finditer(r"(-(\d+))\s*=\s*\{(.*?)\}", provinces_block, re.S):
-        province_id_str, province_body = m.group(2), m.group(3)
-        owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', province_body)
-        if owner_match:
-            try:
-                pid = int(province_id_str)
-                tag = owner_match.group(1)
-                owners[pid] = tag
-            except ValueError:
-                continue
+    # Find entries like: -ID={... owner="TAG" ...}
+    for m in re.finditer(r'-\d+\s*=\s*\{', provinces_block):
+        start_index = m.end()
+        brace_level = 1
+        for i in range(start_index, len(provinces_block)):
+            if provinces_block[i] == '{': brace_level += 1
+            elif provinces_block[i] == '}': brace_level -= 1
+            if brace_level == 0:
+                body = provinces_block[start_index:i]
+                owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', body)
+                if owner_match:
+                    try:
+                        pid = int(m.group(0).split('=')[0].strip().replace('-', ''))
+                        owners[pid] = owner_match.group(1)
+                    except ValueError:
+                        pass
+                break
     return owners
 
 
 def parse_province_blocks(save_text: str) -> Dict[int, Dict[str, object]]:
     """Parses development and other data from province blocks."""
     out: Dict[int, Dict[str, object]] = {}
-    provinces_block = _find_block(save_text, "provinces")
+    provinces_block = _find_block_content(save_text, "provinces")
     if not provinces_block:
         return {}
 
-    for m in re.finditer(r"(-(\d+))\s*=\s*\{(.*?)\}", provinces_block, re.S):
+    # Find entries like: -ID={...}
+    for m in re.finditer(r'(-(\d+))\s*=\s*\{', provinces_block):
         pid = int(m.group(2))
-        body = m.group(3)
+        start_index = m.end()
+        brace_level = 1
+        body = ""
+        for i in range(start_index, len(provinces_block)):
+            if provinces_block[i] == '{': brace_level += 1
+            elif provinces_block[i] == '}': brace_level -= 1
+            if brace_level == 0:
+                body = provinces_block[start_index:i]
+                break
         
+        if not body: continue
+
         d: Dict[str, object] = {}
-        for item_match in re.finditer(r"\b(\w+)\s*=\s*([\d\.]+)", body):
+        # Extract all simple numeric values
+        for item_match in re.finditer(r"(\w+)\s*=\s*(-?[\d\.]+)", body):
             key, val_str = item_match.group(1), item_match.group(2)
             try:
                 d[key] = float(val_str)
             except ValueError:
                 pass
         
-        hist_match = re.search(r"\bhistory\s*=\s*\{([^}]*)\}", body, flags=re.S)
+        # Check inside the history={...} block for base values
+        hist_match = re.search(r"history\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}", body)
         if hist_match:
             hist_body = hist_match.group(1)
             for key in ("base_tax", "base_production", "base_manpower"):
-                val_match = re.search(rf"\b{key}\s*=\s*([\d\.]+)", hist_body)
+                val_match = re.search(rf"{key}\s*=\s*(-?[\d\.]+)", hist_body)
                 if val_match:
                     try:
                         d[key] = float(val_match.group(1))
@@ -396,11 +424,18 @@ def render_map(
         g_ch = np.zeros_like(pid_band, dtype=np.uint8)
         b_ch = np.zeros_like(pid_band, dtype=np.uint8)
         
-        for pid, (r, g, b) in pid_to_color.items():
+        # Use a default color for pixels that don't map to any known PID
+        default_color = (0, 0, 0) # Black for unmapped areas
+        
+        # Vectorize the color lookup
+        unique_pids_in_band = np.unique(pid_band)
+        for pid in unique_pids_in_band:
+            if pid == 0: continue # Skip unmapped pixels
             mask = (pid_band == pid)
-            r_ch[mask] = r
-            g_ch[mask] = g
-            b_ch[mask] = b
+            color = pid_to_color.get(pid, default_color)
+            r_ch[mask] = color[0]
+            g_ch[mask] = color[1]
+            b_ch[mask] = color[2]
             
         out_img_arr[y_start:y_end, :, 0] = r_ch
         out_img_arr[y_start:y_end, :, 1] = g_ch
