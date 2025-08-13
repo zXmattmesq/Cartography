@@ -28,14 +28,7 @@ RENDER_SCALE = float(os.environ.get("RENDER_SCALE", "0.75"))
 VIEWER = Path(os.environ.get("VIEWER_PATH", "eu4_viewer.py")).resolve()
 MAP_PATH = (ASSETS_DIR / "world_map.png").resolve()
 
-# --- INTENTS FIX ---
-# Enable the privileged intents required by the bot.
-# You must also enable these in your bot's settings on the Discord Developer Portal.
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True
-INTENTS.members = True
-# --- END FIX ---
-
 client = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = client.tree  # use the built-in tree
 
@@ -49,7 +42,7 @@ DATASETS = {
     "development": ["country", "province_count", "total_development", "avg_development"],
     "technology": ["country", "adm_tech", "dip_tech", "mil_tech", "technology_group"],
     "legitimacy": ["country", "legitimacy", "republican_tradition", "horde_unity", "stability"],
-    "battles": ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties", "total_casualties"],
+    "battles": ["date", "province_id", "attacker", "defender", "winner", "attacker_casualties", "defender_casualties", "attacker_attrition", "defender_attrition", "total_casualties", "total_attrition"],
 }
 
 def csv_path(name: str) -> Path:
@@ -68,7 +61,7 @@ def human_number(val: str) -> float:
     s = str(val).replace(",", "").strip()
     try:
         return float(s)
-    except (ValueError, TypeError):
+    except:
         return float("-inf")
 
 def format_table(rows: List[Dict[str, str]], columns: List[str], limit: int = 15) -> str:
@@ -98,7 +91,7 @@ class SortView(discord.ui.View):
         if not by:
             return self.rows
         if by == "country":
-            return sorted(self.rows, key=lambda r: str(r.get("country", "")).lower(), reverse=False)
+            return sorted(self.rows, key=lambda r: str(r.get("country", "")).lower(), reverse=True)
         return sorted(self.rows, key=lambda r: human_number(r.get(by, "")), reverse=True)
 
 class SortButton(discord.ui.Button):
@@ -125,7 +118,6 @@ class SortButton(discord.ui.Button):
 # -----------------------------
 async def run_viewer(save_path: Path) -> None:
     args = [
-        sys.executable, # Use the same python interpreter that's running the bot
         shlex.quote(str(VIEWER)),
         shlex.quote(str(save_path)),
         "--assets", shlex.quote(str(ASSETS_DIR)),
@@ -133,23 +125,20 @@ async def run_viewer(save_path: Path) -> None:
         "--scale", str(RENDER_SCALE),
         "--chunk", str(RENDER_CHUNK),
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *args,
+    proc = await asyncio.create_subprocess_shell(
+        "python " + " ".join(args),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        print(f"Viewer script failed with code {proc.returncode}:", file=sys.stderr)
-        print(stderr.decode(), file=sys.stderr)
         raise RuntimeError("Save processing failed")
 
 async def send_map(interaction: discord.Interaction):
     if MAP_PATH.exists():
         try:
             await interaction.followup.send(file=discord.File(str(MAP_PATH)), ephemeral=False)
-        except Exception as e:
-            print(f"Failed to send map: {e}", file=sys.stderr)
+        except Exception:
             await interaction.followup.send("Map generated, but I couldn’t attach it. Try `/map`.", ephemeral=True)
     else:
         await interaction.followup.send("Processed the save, but no map was found. Try `/map`.", ephemeral=True)
@@ -161,7 +150,7 @@ async def send_table(interaction: discord.Interaction, dataset: str, default_sor
         await interaction.followup.send("Unknown table.", ephemeral=True)
         return
     if not rows:
-        await interaction.followup.send("No data found for this table. This usually means the save file was empty or couldn't be read.", ephemeral=True)
+        await interaction.followup.send("No data found for this table.", ephemeral=True)
         return
     view = SortView(dataset, cols, rows, default_sort=default_sort)
     initial = default_sort or (cols[1] if len(cols) > 1 else None)
@@ -179,21 +168,20 @@ async def submit(interaction: discord.Interaction, attachment: discord.Attachmen
             await interaction.followup.send("Please upload a `.eu4` save file.", ephemeral=True)
             return
 
-        tmp = ASSETS_DIR / f"save_{interaction.user.id}_{int(time.time())}.eu4"
-        await attachment.save(tmp)
+        tmp = ASSETS_DIR / f"save_{int(time.time())}.eu4"
+        tmp.write_bytes(await attachment.read())
 
         await run_viewer(tmp)          # process
         await send_map(interaction)     # show only the map
 
         try:
             tmp.unlink(missing_ok=True)
-        except Exception as e:
-            print(f"Failed to clean up temp file {tmp}: {e}", file=sys.stderr)
+        except Exception:
+            pass
 
         await interaction.followup.send("Processed your save. Use `/table` anytime to view stats.", ephemeral=True)
-    except Exception as e:
-        print(f"Error in /submit command: {e}", file=sys.stderr)
-        await interaction.followup.send("I couldn’t process that save. Make sure it’s a valid, uncompressed save file and try again.", ephemeral=True)
+    except Exception:
+        await interaction.followup.send("I couldn’t process that save. Make sure it’s valid and try again.", ephemeral=True)
 
 @tree.command(name="map", description="Show the latest rendered world map")
 async def map_cmd(interaction: discord.Interaction):
@@ -228,12 +216,9 @@ async def table_cmd(interaction: discord.Interaction, name: app_commands.Choice[
 
 @client.event
 async def on_ready():
-    print(f'Logged in as {client.user} (ID: {client.user.id})')
-    print('------')
     try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands.")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
+        await tree.sync()
+    except Exception:
+        pass
 
 client.run(TOKEN)
