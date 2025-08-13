@@ -560,7 +560,8 @@ def main() -> int:
     pid_to_final_color: Dict[int, Tuple[int, int, int]] = {}
     all_pids = set(defmap.values())
     
-    unowned_land_color = (50, 50, 50)
+    unowned_land_color = (80, 80, 80) # Neutral grey for unowned land
+    unspecified_country_color = (128, 128, 128) # Different grey for countries without a defined color
     sea_color = (70, 90, 130)
 
     for pid in all_pids:
@@ -570,7 +571,8 @@ def main() -> int:
         
         owner_tag = owners.get(pid)
         if owner_tag:
-            pid_to_final_color[pid] = tag_colors.get(owner_tag, stable_color_for_tag(owner_tag))
+            # Strictly use the color from the file, or a specific fallback grey
+            pid_to_final_color[pid] = tag_colors.get(owner_tag, unspecified_country_color)
         else:
             pid_to_final_color[pid] = unowned_land_color
 
