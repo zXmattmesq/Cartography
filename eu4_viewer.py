@@ -158,14 +158,12 @@ def get_country_label(tag: str, country_data: Dict[str, object], tag_names: Dict
 
 def _find_block_content(text: str, key: str) -> Optional[str]:
     """Finds and returns the content of a {...} block using brace counting."""
-    # Find the starting pattern: key={
     match = re.search(rf"^{key}\s*=\s*\{{", text, re.MULTILINE)
     if not match:
         return None
     
     start_index = match.end()
     brace_level = 1
-    # Scan the rest of the text to find the matching closing brace
     for i in range(start_index, len(text)):
         if text[i] == '{':
             brace_level += 1
@@ -173,7 +171,7 @@ def _find_block_content(text: str, key: str) -> Optional[str]:
             brace_level -= 1
             if brace_level == 0:
                 return text[start_index:i]
-    return None # Return None if the block is unclosed
+    return None
 
 @dataclass
 class Country:
@@ -187,12 +185,10 @@ def parse_countries_block(save_text: str) -> Dict[str, Country]:
     if not countries_block:
         return out
 
-    # Iterate through TAG={...} definitions within the countries block
     for m in re.finditer(r'([A-Z]{3})\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}', countries_block):
         tag, body = m.group(1), m.group(2)
         data: Dict[str, object] = {}
         
-        # Extract simple key=value pairs
         for item_match in re.finditer(r"(\w+)\s*=\s*(-?[\d\.]+|\"[^\"]*\")", body):
             key, val_str = item_match.group(1), item_match.group(2).strip('"')
             try:
@@ -200,7 +196,6 @@ def parse_countries_block(save_text: str) -> Dict[str, Country]:
             except ValueError:
                 data[key] = val_str
 
-        # Specifically count loans within the loans={...} sub-block
         loans_match = re.search(r"loans\s*=\s*\{", body)
         if loans_match:
             loan_body_start = loans_match.end()
@@ -216,58 +211,27 @@ def parse_countries_block(save_text: str) -> Dict[str, Country]:
     return out
 
 
-def parse_province_owners(save_text: str) -> Dict[int, str]:
-    """Parses the 'provinces' block to find the owner of each province."""
+def parse_province_data(save_text: str) -> Tuple[Dict[int, str], Dict[int, Dict[str, object]]]:
+    """Parses the 'provinces' block for owners and development data in one pass."""
     owners: Dict[int, str] = {}
+    prov_data: Dict[int, Dict[str, object]] = {}
     provinces_block = _find_block_content(save_text, "provinces")
     if not provinces_block:
         print("Warning: 'provinces' block not found in save file.", file=sys.stderr)
-        return {}
+        return {}, {}
 
-    # Find entries like: -ID={... owner="TAG" ...}
-    for m in re.finditer(r'-\d+\s*=\s*\{', provinces_block):
-        start_index = m.end()
-        brace_level = 1
-        for i in range(start_index, len(provinces_block)):
-            if provinces_block[i] == '{': brace_level += 1
-            elif provinces_block[i] == '}': brace_level -= 1
-            if brace_level == 0:
-                body = provinces_block[start_index:i]
-                owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', body)
-                if owner_match:
-                    try:
-                        pid = int(m.group(0).split('=')[0].strip().replace('-', ''))
-                        owners[pid] = owner_match.group(1)
-                    except ValueError:
-                        pass
-                break
-    return owners
-
-
-def parse_province_blocks(save_text: str) -> Dict[int, Dict[str, object]]:
-    """Parses development and other data from province blocks."""
-    out: Dict[int, Dict[str, object]] = {}
-    provinces_block = _find_block_content(save_text, "provinces")
-    if not provinces_block:
-        return {}
-
-    # Find entries like: -ID={...}
-    for m in re.finditer(r'(-(\d+))\s*=\s*\{', provinces_block):
+    # This regex is crucial: it finds the province ID and the entire body of its block.
+    for m in re.finditer(r'(-(\d+))\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}', provinces_block):
         pid = int(m.group(2))
-        start_index = m.end()
-        brace_level = 1
-        body = ""
-        for i in range(start_index, len(provinces_block)):
-            if provinces_block[i] == '{': brace_level += 1
-            elif provinces_block[i] == '}': brace_level -= 1
-            if brace_level == 0:
-                body = provinces_block[start_index:i]
-                break
-        
-        if not body: continue
+        body = m.group(3)
 
+        # Get owner
+        owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', body)
+        if owner_match:
+            owners[pid] = owner_match.group(1)
+
+        # Get development data
         d: Dict[str, object] = {}
-        # Extract all simple numeric values
         for item_match in re.finditer(r"(\w+)\s*=\s*(-?[\d\.]+)", body):
             key, val_str = item_match.group(1), item_match.group(2)
             try:
@@ -275,7 +239,6 @@ def parse_province_blocks(save_text: str) -> Dict[int, Dict[str, object]]:
             except ValueError:
                 pass
         
-        # Check inside the history={...} block for base values
         hist_match = re.search(r"history\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}", body)
         if hist_match:
             hist_body = hist_match.group(1)
@@ -287,8 +250,9 @@ def parse_province_blocks(save_text: str) -> Dict[int, Dict[str, object]]:
                     except ValueError:
                         pass
         if d:
-            out[pid] = d
-    return out
+            prov_data[pid] = d
+            
+    return owners, prov_data
 
 
 def get_province_development(p_data: Dict[str, object]) -> float:
@@ -361,15 +325,6 @@ def parse_battles(save: str, tag_to_name: Dict[str, str]) -> List[Dict[str, obje
 
 # ------------------------ color utilities & rendering ------------------------
 
-def stable_color_for_tag(tag: str) -> Tuple[int, int, int]:
-    """Generates a deterministic, visually distinct color for a given tag string."""
-    h = (hash(tag) & 0xFFFFFF)
-    r = (h >> 16) & 0xFF
-    g = (h >> 8) & 0xFF
-    b = h & 0xFF
-    return (min(255, r + 50), min(255, g + 50), min(255, b + 50))
-
-
 def pack_rgb(arr: np.ndarray) -> np.ndarray:
     """Pack HxWx3 uint8 to HxW uint32 (r<<16|g<<8|b)."""
     arr = arr.astype(np.uint32)
@@ -424,13 +379,11 @@ def render_map(
         g_ch = np.zeros_like(pid_band, dtype=np.uint8)
         b_ch = np.zeros_like(pid_band, dtype=np.uint8)
         
-        # Use a default color for pixels that don't map to any known PID
-        default_color = (0, 0, 0) # Black for unmapped areas
+        default_color = (0, 0, 0)
         
-        # Vectorize the color lookup
         unique_pids_in_band = np.unique(pid_band)
         for pid in unique_pids_in_band:
-            if pid == 0: continue # Skip unmapped pixels
+            if pid == 0: continue
             mask = (pid_band == pid)
             color = pid_to_color.get(pid, default_color)
             r_ch[mask] = color[0]
@@ -486,9 +439,8 @@ def main() -> int:
     tag_names = load_tag_names_csv(assets)
 
     save_text = read_text_save(Path(args.save))
-    owners = parse_province_owners(save_text)
     countries = parse_countries_block(save_text)
-    prov_blocks = parse_province_blocks(save_text)
+    owners, prov_blocks = parse_province_data(save_text)
 
     tag_to_name: Dict[str, str] = {tag: get_country_label(tag, c.raw, tag_names) for tag, c in countries.items()}
 
@@ -560,8 +512,8 @@ def main() -> int:
     pid_to_final_color: Dict[int, Tuple[int, int, int]] = {}
     all_pids = set(defmap.values())
     
-    unowned_land_color = (80, 80, 80) # Neutral grey for unowned land
-    unspecified_country_color = (128, 128, 128) # Different grey for countries without a defined color
+    unowned_land_color = (80, 80, 80)
+    unspecified_country_color = (128, 128, 128)
     sea_color = (70, 90, 130)
 
     for pid in all_pids:
@@ -571,7 +523,6 @@ def main() -> int:
         
         owner_tag = owners.get(pid)
         if owner_tag:
-            # Strictly use the color from the file, or a specific fallback grey
             pid_to_final_color[pid] = tag_colors.get(owner_tag, unspecified_country_color)
         else:
             pid_to_final_color[pid] = unowned_land_color
