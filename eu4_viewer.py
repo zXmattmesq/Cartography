@@ -158,7 +158,7 @@ def get_country_label(tag: str, country_data: Dict[str, object], tag_names: Dict
 
 def _find_block_content(text: str, key: str) -> Optional[str]:
     """Finds and returns the content of a {...} block using brace counting."""
-    match = re.search(rf"^{key}\s*=\s*\{{", text, re.MULTILINE)
+    match = re.search(rf"\b{key}\s*=\s*\{{", text)
     if not match:
         return None
     
@@ -220,17 +220,36 @@ def parse_province_data(save_text: str) -> Tuple[Dict[int, str], Dict[int, Dict[
         print("Warning: 'provinces' block not found in save file.", file=sys.stderr)
         return {}, {}
 
-    # This regex is crucial: it finds the province ID and the entire body of its block.
-    for m in re.finditer(r'(-(\d+))\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}', provinces_block):
-        pid = int(m.group(2))
-        body = m.group(3)
+    # Iterate through each province entry, which starts with -ID={
+    for m in re.finditer(r'(-\d+)\s*=\s*\{', provinces_block):
+        try:
+            pid = int(m.group(1).replace('-', ''))
+        except ValueError:
+            continue
 
-        # Get owner
+        # Find the content of this specific province's block using brace counting
+        block_start = m.end()
+        brace_level = 1
+        body = ""
+        for i in range(block_start, len(provinces_block)):
+            char = provinces_block[i]
+            if char == '{':
+                brace_level += 1
+            elif char == '}':
+                brace_level -= 1
+                if brace_level == 0:
+                    body = provinces_block[block_start:i]
+                    break
+        
+        if not body:
+            continue
+
+        # Parse owner from the body
         owner_match = re.search(r'owner\s*=\s*"([A-Z]{3})"', body)
         if owner_match:
             owners[pid] = owner_match.group(1)
 
-        # Get development data
+        # Parse development data from the body
         d: Dict[str, object] = {}
         for item_match in re.finditer(r"(\w+)\s*=\s*(-?[\d\.]+)", body):
             key, val_str = item_match.group(1), item_match.group(2)
